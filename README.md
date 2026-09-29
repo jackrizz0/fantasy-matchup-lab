@@ -19,7 +19,7 @@ python3 -m venv .venv
 .venv/bin/streamlit run app.py
 ```
 
-Then open http://localhost:8501. The first launch downloads NFL data and weather history (a minute or two).
+Then open http://localhost:8501. The first launch downloads the NFL data (about a minute).
 
 ## Data sources
 
@@ -27,3 +27,15 @@ Then open http://localhost:8501. The first launch downloads NFL data and weather
 - [FTN Data](https://ftndata.com) via nflverse — charting data (blitzes, box counts, motion)
 - [Open-Meteo](https://open-meteo.com) — forecasts and historical weather
 - ESPN — live scores and win probability; Sleeper, ESPN and Yahoo fantasy APIs for roster import
+
+## Deploying (Streamlit Community Cloud)
+
+1. At [share.streamlit.io](https://share.streamlit.io), pick this repository and `app.py`.
+2. Under **Advanced settings**, choose **Python 3.12**.
+3. Optional — Yahoo import: register an app at [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create)
+   (Fantasy Sports: Read) with the site's URL as its Redirect URI, then paste the `[yahoo]` block from
+   `.streamlit/secrets.example.toml` into the app's **Secrets** settings with your values.
+
+Each visitor's Yahoo sign-in and ESPN private-league cookies are kept only in their own browser session
+(in server memory for that session, never written to disk or shared with other visitors).
+The app uses about 350 MB of memory, within the free tier.

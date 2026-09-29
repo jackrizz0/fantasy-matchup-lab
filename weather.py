@@ -8,6 +8,8 @@ from __future__ import annotations
 import datetime as dt
 import time
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import requests
@@ -18,6 +20,9 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HISTORY_START = 2019          # seasons of weather history used for splits
 HISTORY_CACHE = DATA_DIR / "weather_history.parquet"
+# Snapshot committed with the code, so a fresh install (or a cloud host) skips the slow first download
+# and only fetches games played since. Update it with:  cp data/weather_history.parquet assets/
+HISTORY_SEED = Path(__file__).parent / "assets" / "weather_history.parquet"
 INDOOR_ROOFS = {"dome", "closed"}
 WIND_MPH, COLD_F, HOT_F, PRECIP_IN = 15, 40, 85, 0.05   # PRECIP_IN = total over the 3 game hours
 
@@ -91,7 +96,8 @@ def history(games: pd.DataFrame, pbp_frames: list) -> pd.DataFrame:
     g["indoor"] = g.roof.isin(INDOOR_ROOFS)
     g["kickoff"] = [_kickoff(d, t) for d, t in zip(g.gameday, g.gametime)]
 
-    cache = pd.read_parquet(HISTORY_CACHE) if HISTORY_CACHE.exists() else pd.DataFrame(columns=["game_id", "precip", "snow"])
+    source = HISTORY_CACHE if HISTORY_CACHE.exists() else HISTORY_SEED if HISTORY_SEED.exists() else None
+    cache = pd.read_parquet(source) if source else pd.DataFrame(columns=["game_id", "precip", "snow"])
     archive_end = pd.Timestamp(dt.date.today() - dt.timedelta(days=10))  # archive lags; newer games use pbp text
     need = g[~g.indoor & ~g.game_id.isin(cache.game_id) & g.stadium_id.isin(STADIUMS) & (g.kickoff < archive_end)]
     # One request per stadium-season (Sept-Feb only), sequentially: Open-Meteo rate-limits by data volume.

@@ -7,12 +7,9 @@ App ids are nflverse gsis ids for players and "DST_<TEAM>" for team defenses.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 import pandas as pd
 import requests
@@ -165,64 +162,58 @@ def espn_teams(league_id: str, season: int, maps: dict, espn_s2: str = "", swid:
 
 
 # ---------------------------------------------------------------- Yahoo
-# Yahoo requires OAuth: the user registers a free app at https://developer.yahoo.com/apps/create
-# (Fantasy Sports: Read, redirect URI "oob"), then pastes the code Yahoo shows after authorizing.
+# Yahoo requires OAuth. Nothing here stores a login: callers keep the token dict (per visitor, in their
+# browser session) and pass it in. Two setups:
+#   hosted — the site owner registers one Yahoo app whose redirect URI is the site's URL;
+#   local  — redirect URI "oob": Yahoo shows the visitor a code to paste back into the app.
 YAHOO_AUTH = "https://api.login.yahoo.com/oauth2"
 YAHOO_API = "https://fantasysports.yahooapis.com/fantasy/v2"
-YAHOO_TOKEN_FILE = Path(__file__).parent / ".yahoo_auth.json"
 
 
-def yahoo_auth_url(client_id: str) -> str:
-    return f"{YAHOO_AUTH}/request_auth?client_id={client_id.strip()}&redirect_uri=oob&response_type=code"
+def yahoo_auth_url(client_id: str, redirect_uri: str = "oob", state: str = "") -> str:
+    from urllib.parse import urlencode
+    params = {"client_id": client_id.strip(), "redirect_uri": redirect_uri, "response_type": "code"}
+    if state:
+        params["state"] = state
+    return f"{YAHOO_AUTH}/request_auth?{urlencode(params)}"
 
 
-def _yahoo_token_request(client_id: str, client_secret: str, **form) -> dict:
+def _yahoo_token_request(client_id: str, client_secret: str, redirect_uri: str, **form) -> dict:
     try:
         r = requests.post(f"{YAHOO_AUTH}/get_token", auth=(client_id.strip(), client_secret.strip()),
-                          data={"redirect_uri": "oob", **form}, timeout=20)
+                          data={"redirect_uri": redirect_uri, **form}, timeout=20)
     except requests.RequestException as e:
         raise LeagueImportError(f"Couldn't reach Yahoo: {e}") from e
     if not r.ok:
         raise LeagueImportError(f"Yahoo sign-in failed ({r.status_code}). Check the Client ID/Secret, "
-                                "or get a fresh code — each code works only once.")
+                                "or sign in again — each code works only once.")
     tok = r.json()
-    saved = {"client_id": client_id.strip(), "client_secret": client_secret.strip(),
-             "access_token": tok["access_token"], "refresh_token": tok.get("refresh_token", form.get("refresh_token")),
-             "expires_at": time.time() + int(tok.get("expires_in", 3600)) - 60}
-    YAHOO_TOKEN_FILE.write_text(json.dumps(saved))
-    os.chmod(YAHOO_TOKEN_FILE, 0o600)  # readable only by you
-    return saved
+    return {"access_token": tok["access_token"],
+            "refresh_token": tok.get("refresh_token", form.get("refresh_token")),
+            "expires_at": time.time() + int(tok.get("expires_in", 3600)) - 60}
 
 
-def yahoo_connect(client_id: str, client_secret: str, code: str) -> None:
-    _yahoo_token_request(client_id, client_secret, grant_type="authorization_code", code=code.strip())
+def yahoo_exchange_code(client_id: str, client_secret: str, code: str, redirect_uri: str = "oob") -> dict:
+    """Trade the one-time authorization code for a token dict."""
+    return _yahoo_token_request(client_id, client_secret, redirect_uri,
+                                grant_type="authorization_code", code=code.strip())
 
 
-def yahoo_connected() -> bool:
-    return YAHOO_TOKEN_FILE.exists()
+def yahoo_fresh(token: dict, client_id: str, client_secret: str, redirect_uri: str = "oob") -> dict:
+    """Return the token, refreshed first if it has expired (Yahoo access tokens last an hour)."""
+    if time.time() < token["expires_at"]:
+        return token
+    return _yahoo_token_request(client_id, client_secret, redirect_uri,
+                                grant_type="refresh_token", refresh_token=token["refresh_token"])
 
 
-def yahoo_disconnect() -> None:
-    YAHOO_TOKEN_FILE.unlink(missing_ok=True)
-
-
-def _yahoo_access_token() -> str:
-    if not YAHOO_TOKEN_FILE.exists():
-        raise LeagueImportError("Connect your Yahoo account first.")
-    tok = json.loads(YAHOO_TOKEN_FILE.read_text())
-    if time.time() > tok["expires_at"]:
-        tok = _yahoo_token_request(tok["client_id"], tok["client_secret"],
-                                   grant_type="refresh_token", refresh_token=tok["refresh_token"])
-    return tok["access_token"]
-
-
-def _yahoo_get(path: str) -> ET.Element:
+def _yahoo_get(access_token: str, path: str) -> ET.Element:
     try:
-        r = requests.get(f"{YAHOO_API}/{path}", headers={"Authorization": f"Bearer {_yahoo_access_token()}"}, timeout=20)
+        r = requests.get(f"{YAHOO_API}/{path}", headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
     except requests.RequestException as e:
         raise LeagueImportError(f"Couldn't reach Yahoo: {e}") from e
     if r.status_code == 401:
-        raise LeagueImportError("Yahoo rejected the saved sign-in. Disconnect and connect again.")
+        raise LeagueImportError("Yahoo rejected the sign-in. Disconnect and sign in again.")
     if not r.ok:
         raise LeagueImportError(f"Yahoo returned an error ({r.status_code}).")
     root = ET.fromstring(r.content)
@@ -231,13 +222,13 @@ def _yahoo_get(path: str) -> ET.Element:
     return root
 
 
-def yahoo_leagues(season: int) -> list[dict]:
-    root = _yahoo_get("users;use_login=1/games;game_codes=nfl;seasons=%d/leagues" % season)
+def yahoo_leagues(access_token: str, season: int) -> list[dict]:
+    root = _yahoo_get(access_token, "users;use_login=1/games;game_codes=nfl;seasons=%d/leagues" % season)
     return [{"league_key": lg.findtext("league_key"), "name": lg.findtext("name")} for lg in root.iter("league")]
 
 
-def yahoo_teams(league_key: str, maps: dict) -> list[dict]:
-    settings = _yahoo_get(f"league/{league_key}/settings")
+def yahoo_teams(access_token: str, league_key: str, maps: dict) -> list[dict]:
+    settings = _yahoo_get(access_token, f"league/{league_key}/settings")
     slots = {}
     for rp in settings.iter("roster_position"):
         name = YAHOO_SLOTS.get(rp.findtext("position"))
@@ -247,7 +238,7 @@ def yahoo_teams(league_key: str, maps: dict) -> list[dict]:
                 if s.findtext("stat_id") == "11" and s.findtext("value") is not None), 0)  # 11 = receptions
     ppr = _ppr(rec)
 
-    root = _yahoo_get(f"league/{league_key}/teams/roster")
+    root = _yahoo_get(access_token, f"league/{league_key}/teams/roster")
     teams = []
     for t in root.iter("team"):
         ids, unmatched = [], []

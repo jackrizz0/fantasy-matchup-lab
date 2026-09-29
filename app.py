@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 
 import pandas as pd
 import requests
@@ -37,44 +38,107 @@ def apply_import(team: dict):
     st.session_state["import_msg"] = (team["team"], team["unmatched"])
 
 
+def yahoo_config() -> dict:
+    """Site-wide Yahoo app, from .streamlit/secrets.toml (or the host's secrets settings):
+        [yahoo]
+        client_id = "..."
+        client_secret = "..."
+        redirect_uri = "https://your-app.streamlit.app"   # omit when running locally (uses "oob")
+    """
+    try:
+        return dict(st.secrets.get("yahoo", {}))
+    except Exception:  # no secrets file at all
+        return {}
+
+
+def _yahoo_creds() -> tuple[str, str, str]:
+    cfg = yahoo_config()
+    cid, secret = st.session_state.get("yahoo_creds", (cfg.get("client_id", ""), cfg.get("client_secret", "")))
+    return cid, secret, cfg.get("redirect_uri", "oob")
+
+
+def yahoo_handle_redirect():
+    """Back from Yahoo's sign-in page (hosted setup): the URL carries ?code=...&state=yahoo."""
+    qp = st.query_params
+    if qp.get("state") != "yahoo" or not qp.get("code"):
+        return
+    code = qp["code"]
+    del qp["code"], qp["state"]
+    cid, secret, redirect = _yahoo_creds()
+    st.session_state["import_platform"] = "Yahoo"
+    try:
+        st.session_state["yahoo_token"] = importers.yahoo_exchange_code(cid, secret, code, redirect)
+    except importers.LeagueImportError as e:
+        st.session_state["yahoo_error"] = str(e)
+
+
+def _session_memo(key, fn):
+    """Per-visitor 5-minute memo for signed-in calls (Yahoo, private ESPN leagues). The shared cache would keep one
+    visitor's credentials and leagues in memory where another visitor's identical request could reuse them."""
+    memo = st.session_state.setdefault("session_memo", {})
+    hit = memo.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    value = fn()
+    memo[key] = (time.time(), value)
+    return value
+
+
 def yahoo_section(season: int, maps: dict):
-    """Yahoo needs a one-time OAuth connection; after that it works like the others."""
-    if not importers.yahoo_connected():
-        st.markdown(
-            "**One-time setup** (about 2 minutes):\n"
-            "1. Go to [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create). "
-            "Name it anything, set **Redirect URI** to `oob`, and tick **Fantasy Sports → Read**.\n"
-            "2. Paste the **Client ID** and **Client Secret** Yahoo gives you below.\n"
-            "3. Click the authorize link, approve, and paste the code Yahoo shows you.")
-        c1, c2 = st.columns(2)
-        cid = c1.text_input("Client ID", type="password", key="y_cid")
-        secret = c2.text_input("Client Secret", type="password", key="y_secret")
+    """Each visitor signs in to their own Yahoo account; the token lives only in their browser session."""
+    if "yahoo_error" in st.session_state:
+        st.error(st.session_state.pop("yahoo_error"))
+    cid, secret, redirect = _yahoo_creds()
+    tok = st.session_state.get("yahoo_token")
+    if tok is None:
+        if cid and secret and redirect != "oob":  # hosted: one click, Yahoo sends the visitor back here
+            st.link_button("Sign in with Yahoo", importers.yahoo_auth_url(cid, redirect, "yahoo"), type="primary")
+            st.caption("You'll approve read-only access to your Yahoo Fantasy leagues. The sign-in lasts for this "
+                       "browser session only and isn't stored.")
+            return None
+        if not (cid and secret):
+            st.markdown(
+                "**One-time setup** (about 2 minutes):\n"
+                "1. Go to [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create). "
+                "Name it anything, set **Redirect URI** to `oob`, and tick **Fantasy Sports → Read**.\n"
+                "2. Paste the **Client ID** and **Client Secret** Yahoo gives you below.\n"
+                "3. Click the authorize link, approve, and paste the code Yahoo shows you.")
+            c1, c2 = st.columns(2)
+            cid = c1.text_input("Client ID", type="password", key="y_cid")
+            secret = c2.text_input("Client Secret", type="password", key="y_secret")
         if cid:
             st.markdown(f"[👉 Authorize with Yahoo]({importers.yahoo_auth_url(cid)})")
         code = st.text_input("Code from Yahoo", key="y_code")
         if st.button("Connect Yahoo", disabled=not (cid and secret and code)):
-            importers.yahoo_connect(cid, secret, code)
+            st.session_state["yahoo_token"] = importers.yahoo_exchange_code(cid, secret, code)
+            st.session_state["yahoo_creds"] = (cid, secret)
             st.rerun()
-        st.caption("Your Yahoo credentials are saved only in `.yahoo_auth.json` in this project folder, "
-                   "readable only by your user account, and are only sent to Yahoo.")
+        st.caption("Your Yahoo sign-in is kept only in this browser session — it's gone when you refresh or close "
+                   "the page — and is only sent to Yahoo. To skip retyping the Client ID and Secret, put them in "
+                   "`.streamlit/secrets.toml` under `[yahoo]`.")
         return None
+    tok = importers.yahoo_fresh(tok, cid, secret, redirect)
+    st.session_state["yahoo_token"] = tok
     c1, c2 = st.columns([3, 1])
-    c1.success("Yahoo connected.")
+    c1.success("Yahoo connected (this browser session only).")
     if c2.button("Disconnect"):
-        importers.yahoo_disconnect()
-        cached.clear()
+        for k in ("yahoo_token", "yahoo_creds", "session_memo"):
+            st.session_state.pop(k, None)
         st.rerun()
-    leagues = cached("yahoo_leagues", season)
+    leagues = _session_memo(("leagues", season), lambda: importers.yahoo_leagues(tok["access_token"], season))
     if not leagues:
         st.warning(f"No {season} Yahoo leagues found on this account.")
         return None
     league = st.selectbox("League", leagues, format_func=lambda lg: lg["name"])
-    return cached("yahoo_teams", league["league_key"], maps)
+    return _session_memo(("teams", league["league_key"]),
+                       lambda: importers.yahoo_teams(tok["access_token"], league["league_key"], maps))
 
 
 def import_panel(season: int, data: dict):
-    with st.expander("📥 Import your team from Sleeper, ESPN or Yahoo", expanded=not st.query_params.get_all("p")):
-        platform = st.radio("Platform", ["Sleeper", "ESPN", "Yahoo"], horizontal=True)
+    yahoo_handle_redirect()
+    with st.expander("📥 Import your team from Sleeper, ESPN or Yahoo",
+                     expanded=not st.query_params.get_all("p") or "yahoo_token" in st.session_state):
+        platform = st.radio("Platform", ["Sleeper", "ESPN", "Yahoo"], horizontal=True, key="import_platform")
         maps = get_id_maps(season)
         teams = None
         try:
@@ -102,7 +166,11 @@ def import_panel(season: int, data: dict):
                 s2 = c1.text_input("espn_s2 (private leagues only)", type="password", key="espn_s2")
                 swid = c2.text_input("SWID (private leagues only)", type="password", key="espn_swid")
                 if league_id:
-                    teams = cached("espn_teams", league_id, season, maps, s2, swid)
+                    if s2 and swid:  # private league: keep the visitor's cookies out of the shared cache
+                        teams = _session_memo(("espn", league_id, season),
+                                              lambda: importers.espn_teams(league_id, season, maps, s2, swid))
+                    else:
+                        teams = cached("espn_teams", league_id, season, maps, "", "")
         except importers.LeagueImportError as e:
             st.error(str(e))
         except Exception as e:  # unexpected API shape
@@ -122,7 +190,9 @@ def import_panel(season: int, data: dict):
                        + ". They may be injured/inactive or missing from NFL roster data — add them manually if needed.")
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Downloading NFL data from nflverse…")
+# cache_resource shares one read-only copy between all visitors; cache_data would hand every caller a fresh copy
+# of the play-by-play tables, multiplying memory use. Nothing downstream modifies these frames in place.
+@st.cache_resource(ttl=6 * 3600, show_spinner="Downloading NFL data from nflverse…")
 def get_data(season: int, force: bool = False):
     return load_all(season, force)
 
@@ -236,6 +306,7 @@ with st.sidebar:
     st.divider()
     if st.button("↻ Refresh data", width="stretch"):
         st.cache_data.clear()
+        get_data.clear()
         get_data(season, force=True)
         st.rerun()
     st.caption("Stats refresh every few hours; forecasts hourly.")
@@ -554,5 +625,7 @@ with tab_def:
                f"{pers_season} NFL participation data (the latest published). Green = more fantasy points allowed. "
                "The D/ST column is how many points opposing defenses score against this team's offense.")
 
-st.caption("Data: nflverse (play-by-play, FTN charting, participation, rosters, schedules & Vegas lines) · "
-           "Weather: Open-Meteo · Logos & headshots: ESPN / NFL.")
+st.caption("Data: [nflverse](https://github.com/nflverse) (play-by-play, participation, rosters, schedules & Vegas "
+           "lines) · Charting data: [FTN Data](https://ftndata.com), licensed "
+           "[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) · Weather data by "
+           "[Open-Meteo.com](https://open-meteo.com) (CC BY 4.0) · Scores, win probability, logos & headshots: ESPN / NFL.")

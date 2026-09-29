@@ -1,5 +1,7 @@
-pandas
-pyarrow
-streamlit
-requests
-matplotlib
+# Tested with Python 3.9 locally; use Python 3.12 on Streamlit Community Cloud (Advanced settings at deploy).
+streamlit>=1.50,<2
+pandas>=2.2,<3
+pyarrow>=17
+requests>=2.31
+matplotlib>=3.8
+altair>=5,<6
