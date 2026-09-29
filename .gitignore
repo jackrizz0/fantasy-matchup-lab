@@ -1,0 +1,7 @@
+.venv/
+data/
+.yahoo_auth.json
+__pycache__/
+.DS_Store
+*.pyc
+.streamlit/secrets.toml

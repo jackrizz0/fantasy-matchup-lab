@@ -1,0 +1,32 @@
+[server]
+# Skips the first-run email prompt and runs without trying to open a browser tab itself.
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+# "Game night" theme: deep navy field, turf-green accent, condensed sports headings.
+[theme]
+base = "dark"
+primaryColor = "#3DDC84"
+backgroundColor = "#0A0F1C"
+secondaryBackgroundColor = "#131B2E"
+textColor = "#E7ECF5"
+linkColor = "#6FC3FF"
+borderColor = "#22304D"
+dataframeBorderColor = "#1E2A44"
+dataframeHeaderBackgroundColor = "#101829"
+showWidgetBorder = true
+baseRadius = "10px"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Barlow Condensed:https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&display=swap"
+headingFontWeights = [700, 700, 600]
+greenColor = "#3DDC84"
+redColor = "#FF6B6B"
+yellowColor = "#FFC857"
+blueColor = "#6FC3FF"
+
+[theme.sidebar]
+backgroundColor = "#0E1526"
+secondaryBackgroundColor = "#16203A"
+borderColor = "#22304D"

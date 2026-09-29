@@ -1,0 +1,558 @@
+"""Fantasy Matchup Lab — run with:  streamlit run app.py"""
+from __future__ import annotations
+
+import datetime as dt
+
+import pandas as pd
+import requests
+import streamlit as st
+
+import importers
+import model
+import ui
+import weather
+import winprob
+from data import load_all
+
+st.set_page_config(page_title="Fantasy Matchup Lab", page_icon="🏈", layout="wide")
+
+SCORING = {"PPR": 1.0, "Half PPR": 0.5, "Standard": 0.0}
+DEFAULT_SLOTS = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "SUPERFLEX": 0, "K": 1, "DST": 1}
+SLOT_MAX = {"QB": 2, "RB": 4, "WR": 5, "TE": 3, "FLEX": 4, "SUPERFLEX": 2, "K": 2, "DST": 2}
+SLOT_LABELS = {"DST": "D/ST"}
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching your league…")
+def cached(fn_name: str, *args):
+    """Cache fantasy-site API calls for 5 minutes so reruns don't re-hit their servers."""
+    return getattr(importers, fn_name)(*args)
+
+
+def apply_import(team: dict):
+    """Button callback: runs before the rerun, so it may set keyed widget values."""
+    for slot in DEFAULT_SLOTS:
+        st.session_state[f"slot_{slot}"] = min(team["slots"].get(slot, 0), SLOT_MAX[slot])
+    st.session_state["scoring"] = {v: k for k, v in SCORING.items()}[team["ppr"]]
+    st.session_state["import_ids"] = team["player_ids"]
+    st.session_state["import_msg"] = (team["team"], team["unmatched"])
+
+
+def yahoo_section(season: int, maps: dict):
+    """Yahoo needs a one-time OAuth connection; after that it works like the others."""
+    if not importers.yahoo_connected():
+        st.markdown(
+            "**One-time setup** (about 2 minutes):\n"
+            "1. Go to [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create). "
+            "Name it anything, set **Redirect URI** to `oob`, and tick **Fantasy Sports → Read**.\n"
+            "2. Paste the **Client ID** and **Client Secret** Yahoo gives you below.\n"
+            "3. Click the authorize link, approve, and paste the code Yahoo shows you.")
+        c1, c2 = st.columns(2)
+        cid = c1.text_input("Client ID", type="password", key="y_cid")
+        secret = c2.text_input("Client Secret", type="password", key="y_secret")
+        if cid:
+            st.markdown(f"[👉 Authorize with Yahoo]({importers.yahoo_auth_url(cid)})")
+        code = st.text_input("Code from Yahoo", key="y_code")
+        if st.button("Connect Yahoo", disabled=not (cid and secret and code)):
+            importers.yahoo_connect(cid, secret, code)
+            st.rerun()
+        st.caption("Your Yahoo credentials are saved only in `.yahoo_auth.json` in this project folder, "
+                   "readable only by your user account, and are only sent to Yahoo.")
+        return None
+    c1, c2 = st.columns([3, 1])
+    c1.success("Yahoo connected.")
+    if c2.button("Disconnect"):
+        importers.yahoo_disconnect()
+        cached.clear()
+        st.rerun()
+    leagues = cached("yahoo_leagues", season)
+    if not leagues:
+        st.warning(f"No {season} Yahoo leagues found on this account.")
+        return None
+    league = st.selectbox("League", leagues, format_func=lambda lg: lg["name"])
+    return cached("yahoo_teams", league["league_key"], maps)
+
+
+def import_panel(season: int, data: dict):
+    with st.expander("📥 Import your team from Sleeper, ESPN or Yahoo", expanded=not st.query_params.get_all("p")):
+        platform = st.radio("Platform", ["Sleeper", "ESPN", "Yahoo"], horizontal=True)
+        maps = get_id_maps(season)
+        teams = None
+        try:
+            if platform == "Sleeper":
+                c1, c2 = st.columns(2)
+                username = c1.text_input("Sleeper username", key="sleeper_user")
+                league_id = c2.text_input("…or league ID", key="sleeper_league")
+                user_id = cached("sleeper_user_id", username) if username else None
+                if user_id and not league_id:
+                    leagues = cached("sleeper_leagues", user_id, season)
+                    if not leagues:
+                        st.warning(f"No {season} leagues found for {username}.")
+                    else:
+                        league_id = st.selectbox("League", leagues, format_func=lambda lg: lg["name"])["league_id"]
+                if league_id:
+                    teams = cached("sleeper_teams", league_id, maps, user_id)
+            elif platform == "Yahoo":
+                teams = yahoo_section(season, maps)
+            else:
+                league_id = st.text_input("ESPN league ID (the leagueId=… number in your league's URL)", key="espn_league")
+                st.caption("Private league? Add two cookies from your browser while logged in to ESPN "
+                           "(Developer Tools → Application → Cookies → espn.com). They stay on this computer "
+                           "and are only sent to ESPN.")
+                c1, c2 = st.columns(2)
+                s2 = c1.text_input("espn_s2 (private leagues only)", type="password", key="espn_s2")
+                swid = c2.text_input("SWID (private leagues only)", type="password", key="espn_swid")
+                if league_id:
+                    teams = cached("espn_teams", league_id, season, maps, s2, swid)
+        except importers.LeagueImportError as e:
+            st.error(str(e))
+        except Exception as e:  # unexpected API shape
+            st.error(f"Import failed: {e}")
+        if teams:
+            teams = sorted(teams, key=lambda t: not t["mine"])  # your team first when we can tell
+            team = st.selectbox("Your team", teams,
+                                format_func=lambda t: f"{t['team']} ({t['owner']})" + (" ← you" if t["mine"] else ""))
+            st.caption(f"{len(team['player_ids'])} players · {team['ppr']:g} PPR · slots: "
+                       + ", ".join(f"{n} {SLOT_LABELS.get(s, s)}" for s, n in team["slots"].items()))
+            st.button("Import this roster & league settings", type="primary", on_click=apply_import, args=(team,))
+    if "import_msg" in st.session_state:
+        name, unmatched = st.session_state.pop("import_msg")
+        st.success(f"Imported {name}.")
+        if unmatched:
+            st.warning("Couldn't match: " + ", ".join(unmatched)
+                       + ". They may be injured/inactive or missing from NFL roster data — add them manually if needed.")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Downloading NFL data from nflverse…")
+def get_data(season: int, force: bool = False):
+    return load_all(season, force)
+
+
+@st.cache_data(ttl=6 * 3600)
+def get_id_maps(season: int):
+    return importers.id_maps(get_data(season))
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Crunching matchups…")
+def get_projections(season: int, ppr: float, week: int):
+    return model.project(get_data(season), ppr, week)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Loading weather history (first run takes a minute or two)…")
+def get_weather_history(season: int):
+    d = get_data(season)
+    return weather.history(d["games"], [d["pbp"], d["pbp_prev"]])
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching kickoff forecasts…")
+def get_forecast(season: int, week: int):
+    g = get_data(season)["games"]
+    return weather.forecast(g[(g.season == season) & (g.week == week) & (g.game_type == "REG")])
+
+
+@st.cache_data(ttl=6 * 3600)
+def get_weather_model(season: int, ppr: float, week: int):
+    _, c = get_projections(season, ppr, week)
+    hist = get_weather_history(season)
+    return (weather.position_effects(c["fp_all"], c["info"], hist), weather.team_splits(hist),
+            weather.player_splits(c["fp_all"], hist), weather.league_effects(hist))
+
+
+# Win probabilities: the scoreboard is cheap and refreshed often; each game's detail is cached by its state
+# (pregame odds/predictor for an hour, live win probability for ~30 seconds, finished games for a day).
+@st.cache_data(ttl=25, show_spinner=False)
+def get_scoreboard(season: int, week: int):
+    try:
+        return winprob.scoreboard(season, week)
+    except (requests.RequestException, ValueError, KeyError):
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def summary_pre(espn_id: str):
+    return winprob.summary(espn_id)
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def summary_live(espn_id: str):
+    return winprob.summary(espn_id)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def summary_final(espn_id: str):
+    return winprob.summary(espn_id)
+
+
+def still_live(season: int, week: int) -> pd.DataFrame:
+    """Games from an earlier week that are still being played (e.g. Monday night while the app shows next week)."""
+    if week < 1:
+        return pd.DataFrame()
+    games = [g for g in get_scoreboard(season, week) if g["state"] == "in"]
+    summaries = {}
+    for g in games:
+        try:
+            summaries[g["espn_id"]] = summary_live(g["espn_id"])
+        except (requests.RequestException, ValueError, KeyError):
+            pass
+    return winprob.combine(games, summaries) if games else pd.DataFrame()
+
+
+def get_winprobs(season: int, week: int) -> pd.DataFrame:
+    games = get_scoreboard(season, week)
+    fetch = {"pre": summary_pre, "in": summary_live, "post": summary_final}
+    summaries = {}
+    for g in games:
+        try:
+            summaries[g["espn_id"]] = fetch.get(g["state"], summary_pre)(g["espn_id"])
+        except (requests.RequestException, ValueError, KeyError):
+            pass
+    return winprob.combine(games, summaries)
+
+
+
+# ---------------------------------------------------------------- sidebar
+ui.inject_css()
+today = dt.date.today()
+default_season = today.year if today.month >= 9 else today.year - 1
+with st.sidebar:
+    st.markdown("## 🏈 Matchup Lab")
+    c1, c2 = st.columns(2)
+    season = c1.number_input("Season", 2016, today.year, default_season)
+    data = get_data(season)
+    if data["pbp"] is None:
+        st.error(f"No {season} play-by-play published yet.")
+        st.stop()
+    week = c2.number_input("Week", 1, 18, model.default_week(data["games"], season))
+    # Keyed widgets so an imported league can set scoring and lineup slots.
+    st.session_state.setdefault("scoring", "PPR")
+    for slot, n in DEFAULT_SLOTS.items():
+        st.session_state.setdefault(f"slot_{slot}", n)
+    scoring = st.segmented_control("Scoring", list(SCORING), key="scoring") or "PPR"
+    ppr = SCORING[scoring]
+    with st.expander("Lineup slots", expanded=False):
+        c1, c2 = st.columns(2)
+        slots = {slot: (c1, c2)[i % 2].number_input(SLOT_LABELS.get(slot, slot), 0, SLOT_MAX[slot], key=f"slot_{slot}")
+                 for i, slot in enumerate(DEFAULT_SLOTS)}
+    st.caption("Imported leagues set scoring and slots automatically.")
+    st.divider()
+    if st.button("↻ Refresh data", width="stretch"):
+        st.cache_data.clear()
+        get_data(season, force=True)
+        st.rerun()
+    st.caption("Stats refresh every few hours; forecasts hourly.")
+
+proj, ctx = get_projections(season, ppr, week)
+effects, tsplits, psplits, league_wx = get_weather_model(season, ppr, week)
+fc = get_forecast(season, week)
+proj = weather.apply(proj, fc, effects)
+teams = ui.Teams(data.get("teams"))
+fc_by_team = weather.by_team(fc)
+wp = get_winprobs(season, week)
+team_wp = winprob.team_win_prob(wp) if len(wp) else {}
+proj["win_prob"] = proj.team.map(lambda t: team_wp.get(t, (None, None))[0]).astype(float)
+proj["win_source"] = proj.team.map(lambda t: team_wp.get(t, (None, None))[1])
+defense, offense, sched = ctx["defense"], ctx["offense"], ctx["schedule"]
+pers_season = defense.attrs.get("personnel_season")
+label = lambda pid: f"{proj.at[pid, 'name']} ({proj.at[pid, 'position']}, {proj.at[pid, 'team']})"
+
+
+def notes(r: pd.Series) -> list[str]:
+    return model.matchup_notes(r, ctx) + weather.notes(r, fc, tsplits, psplits)
+
+
+# ---------------------------------------------------------------- header
+played_through = int(ctx["fp_cur"].week.max()) if len(ctx["fp_cur"]) else 0
+wx_games = int(fc.tags.map(lambda t: any(c in weather.ADVERSE for c in t)).sum()) if len(fc) else 0
+prev_live = still_live(season, week - 1)
+live_now = int((wp.state == "in").sum()) + len(prev_live) if len(wp) else len(prev_live)
+ui.hero(f"{season} season · {scoring}", "MATCHUP LAB",
+        "Opponent scheme, personnel, weather and live win odds — turned into your best lineup.",
+        str(week), "week",
+        [f"🔴 {live_now} live now" if live_now else f"🏈 {len(sched) // 2} games this week",
+         f"🌦️ {wx_games} weather games" if wx_games else "☀️ No weather concerns",
+         f"📊 Stats through Week {played_through}", f"🧩 Personnel data: {pers_season}"])
+
+
+@st.fragment(run_every=30 if live_now else None)
+def live_scoreboard():
+    """Re-runs on its own every 30s while games are live, without reloading the rest of the page."""
+    st.markdown(ui.scoreboard_strip(pd.concat([still_live(season, week - 1), get_winprobs(season, week)],
+                                              ignore_index=True), teams), unsafe_allow_html=True)
+
+
+live_scoreboard()
+
+DISPLAY = {"name": "Player", "position": "Pos", "team": "Team", "opp": "Opp", "proj": "Proj",
+           "ppg": f"{season} PPG", "last3": "Last 3", "ppg_prev": f"{season - 1} PPG",
+           "tgt_share": "Tgt %", "carry_share": "Carry %", "adot": "aDOT", "rz": "RZ opps",
+           "dvp_mult": "Matchup ×", "scheme_mult": "Scheme ×", "env_mult": "Vegas ×", "weather_mult": "Weather ×",
+           "implied_total": "Implied pts", "win_prob": "Win %", "weather": "Weather"}
+PERSONNEL_COLS = {
+    "plays": st.column_config.NumberColumn("Plays", format="%d"),
+    "share": st.column_config.ProgressColumn("Usage", format="percent", min_value=0, max_value=1),
+    "pass_rate": st.column_config.NumberColumn("Pass rate", format="percent"),
+    "success_rate": st.column_config.NumberColumn("Success", format="percent"),
+    "epa_per_play": st.column_config.NumberColumn("EPA / play", format="%+.2f"),
+}
+MULTS = ["Matchup ×", "Scheme ×", "Vegas ×", "Weather ×"]
+
+
+def photo(r) -> str:
+    return teams.logo(r.team) if r.position == "DST" or not isinstance(r.get("headshot"), str) else r.headshot
+
+
+def table(df: pd.DataFrame, height: int | str = "auto"):
+    view = df.assign(photo=[photo(r) for _, r in df.iterrows()])
+    out = view[["photo"] + [c for c in DISPLAY if c in view]].rename(columns=DISPLAY)
+    mults = [m for m in MULTS if m in out]
+    styled = out.style.map(ui.mult_color, subset=mults).format({m: "{:.2f}" for m in mults}, na_rep="–")
+    pct = {c: st.column_config.ProgressColumn(c, format="percent", min_value=0, max_value=1)
+           for c in ["Tgt %", "Carry %", "Win %"]}
+    nums = {c: st.column_config.NumberColumn(c, format="%.1f")
+            for c in [f"{season} PPG", "Last 3", f"{season - 1} PPG", "aDOT", "Implied pts"]}
+    st.dataframe(styled, hide_index=True, width="stretch", height=height, column_config={
+        "photo": st.column_config.ImageColumn("", width="small"),
+        "Player": st.column_config.TextColumn("Player", width="medium"),
+        "Proj": st.column_config.ProgressColumn("Proj", format="%.1f", min_value=0,
+                                                max_value=float(max(proj.proj.max(), 1))),
+        "RZ opps": st.column_config.NumberColumn("RZ opps", format="%d"),
+        **pct, **nums})
+
+
+def win_panel(g: pd.Series, away: str, home: str):
+    """Win-probability numbers from each source, plus the live chart once the game has started."""
+    c1, c2, c3 = st.columns(3)
+    mh, fh = g.market_home, g.fpi_home
+    c1.metric("Betting market", f"{home} {mh:.0%}" if mh is not None and pd.notna(mh) else "–",
+              f"{away} {1 - mh:.0%}" if mh is not None and pd.notna(mh) else None, delta_color="off",
+              help="Moneyline odds with the bookmaker's margin removed.")
+    c2.metric("ESPN predictor", f"{home} {fh:.0%}" if fh is not None and pd.notna(fh) else "–",
+              f"{away} {1 - fh:.0%}" if fh is not None and pd.notna(fh) else None, delta_color="off",
+              help="ESPN's pregame Matchup Predictor (FPI).")
+    live = g.series[-1] if g.series else None
+    c3.metric("Live win probability" if g.state == "in" else "In-game win prob.",
+              f"{home} {ui.pct(live, g.state == 'in')}" if live is not None else "Not started",
+              f"{away} {ui.pct(1 - live, g.state == 'in')}" if live is not None else None, delta_color="off",
+              help="ESPN's in-game model, updated after every play.")
+    if g.series:
+        import altair as alt
+        d = pd.DataFrame({"play": range(len(g.series)), "home": g.series})
+        base = alt.Chart(d).encode(x=alt.X("play:Q", title=None, axis=alt.Axis(labels=False, ticks=False)))
+        area = base.mark_area(line={"color": teams.color(home), "strokeWidth": 2}, opacity=.35,
+                              color=teams.color(home)).encode(
+            y=alt.Y("home:Q", title=f"{home} win %", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
+            tooltip=[alt.Tooltip("home:Q", title=f"{home} win %", format=".0%")])
+        mid = alt.Chart(pd.DataFrame({"y": [0.5]})).mark_rule(strokeDash=[4, 4], color="#6B7894").encode(y="y:Q")
+        st.altair_chart((area + mid).properties(height=200), width="stretch")
+
+
+def card_grid(rows: pd.DataFrame, slot_of, ncols: int = 3):
+    for start in range(0, len(rows), ncols):
+        cols = st.columns(ncols)
+        for col, (pid, r) in zip(cols, list(rows.iterrows())[start:start + ncols]):
+            with col:
+                st.markdown(ui.player_card(r, slot_of(r), teams, fc_by_team.get(r.team), defense),
+                            unsafe_allow_html=True)
+                with st.expander("Why this projection"):
+                    for n in notes(r):
+                        st.markdown(f'<div class="ml-note">• {n}</div>', unsafe_allow_html=True)
+
+
+def metric_grid(items: list, ncols: int = 3):
+    """items: (label, value, league_avg, kind) where kind is 'pct', 'num' or 'epa'."""
+    fmt = {"pct": lambda v: f"{v:.0%}", "num": lambda v: f"{v:.1f}", "epa": lambda v: f"{v:+.3f}"}
+    dfmt = {"pct": lambda d: f"{d * 100:+.0f} pts vs lg", "num": lambda d: f"{d:+.1f} vs lg",
+            "epa": lambda d: f"{d:+.3f} vs lg"}
+    cols = st.columns(ncols)
+    for i, (lab, v, lg, kind) in enumerate(items):
+        if v is None or pd.isna(v):
+            cols[i % ncols].metric(lab, "–")
+        else:
+            cols[i % ncols].metric(lab, fmt[kind](v), dfmt[kind](v - lg) if pd.notna(lg) else None, delta_color="off")
+
+
+tab_lineup, tab_rank, tab_game, tab_wx, tab_def = st.tabs(
+    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses"])
+
+# ---------------------------------------------------------------- my lineup
+with tab_lineup:
+    import_panel(season, data)
+    if "import_ids" in st.session_state:
+        imported = st.session_state.pop("import_ids")
+        st.query_params["p"] = imported
+        missing = [p for p in imported if p not in proj.index]
+        if missing:
+            names = ctx["info"].name.reindex(missing).fillna("unknown player")
+            st.info("On your roster but without a projection (no recent games): " + ", ".join(names))
+    saved = [p for p in st.query_params.get_all("p") if p in proj.index]
+    roster = st.multiselect("Your roster", proj.index.tolist(), default=saved, format_func=label,
+                            placeholder="Search players, kickers or D/STs (e.g. “MIN D/ST”)…",
+                            help="Your roster is saved in the page link — bookmark it to come back to it.")
+    if roster != saved:
+        st.query_params["p"] = roster
+    if not roster:
+        st.info("Import your team above or add players to get your optimal lineup, with the reasons behind every pick.")
+    else:
+        lineup = model.optimize_lineup(proj.loc[roster], slots)
+        bench = proj.loc[[p for p in roster if p not in lineup.index]].sort_values("proj", ascending=False)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Projected points", f"{lineup.proj.sum():.1f}")
+        m2.metric("Strong matchups", int((lineup.dvp_mult >= 1.04).sum()), help="Starters facing a defense that "
+                  "allows more fantasy points than average to their position.")
+        m3.metric("Weather-affected starters", int((lineup.weather_mult.sub(1).abs() > 0.005).sum()))
+        byes = int(lineup.opp.isna().sum())
+        m4.metric("Starters on bye", byes, help="Swap these out!" if byes else None)
+        ui.section("Starting lineup")
+        slot_by_id = dict(zip(lineup.index, lineup.slot))
+        card_grid(lineup, lambda r: slot_by_id[r.name])
+        if len(bench):
+            ui.section("Bench")
+            card_grid(bench, lambda r: "BENCH", ncols=4)
+        with st.expander("Full numbers for your roster"):
+            table(proj.loc[roster])
+
+# ---------------------------------------------------------------- rankings
+with tab_rank:
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        pos = st.segmented_control("Position", ["FLEX"] + model.POSITIONS, default="FLEX",
+                                   format_func=lambda p: SLOT_LABELS.get(p, p))
+    search = c2.text_input("Find a player", placeholder="Name or team…")
+    view = proj[proj.opp.notna()]
+    view = view[view.position.isin(["RB", "WR", "TE"] if pos in (None, "FLEX") else [pos])]
+    if search:
+        view = view[view.name.str.contains(search, case=False, regex=False) | view.team.str.fullmatch(search.upper())]
+    table(view.head(80), height=720)
+    st.caption("**Proj** = blended points per game (this season, with last season as a prior) × **Matchup** "
+               "(opponent points allowed to the position) × **Scheme** (opponent efficiency vs pass/run) × "
+               "**Vegas** (implied team total) × **Weather** (how the position scores in the forecast conditions). "
+               "Green multipliers help, red ones hurt.")
+
+# ---------------------------------------------------------------- game breakdown
+with tab_game:
+    if sched.empty:
+        st.warning("No schedule found for this week.")
+    else:
+        games = sched[sched.home].reset_index()
+        pick = st.selectbox("Game", games.index,
+                            format_func=lambda i: f"{games.opp[i]} @ {games.team[i]}  ·  {games.gameday[i]}")
+        home, away = games.team[pick], games.opp[pick]
+        f = fc_by_team.get(home)
+        g = wp[(wp.home == home) & (wp.away == away)].iloc[0] if len(wp) and ((wp.home == home) & (wp.away == away)).any() else None
+        st.markdown(ui.game_banner(away, home, teams, sched, f, g), unsafe_allow_html=True)
+        if g is not None:
+            win_panel(g, away, home)
+        if f is not None:
+            if pd.notna(f.get("temp")):
+                st.caption(f"Forecast: {f.summary}")
+            for cond in [c for c in f.tags if c in weather.ADVERSE]:
+                parts = [f"{t} {tsplits.at[(t, cond), 'ppg']:.1f} pts/gm ({tsplits.at[(t, cond), 'ppg_diff']:+.1f} vs norm, "
+                         f"{tsplits.at[(t, cond), 'games']:.0f} gms)" for t in (away, home) if (t, cond) in tsplits.index]
+                if parts:
+                    st.caption(f"{ui.WX_ICON.get(cond, '')} In {cond.lower()} games since {weather.HISTORY_START}: "
+                               + " · ".join(parts))
+        side = st.segmented_control("Matchup", [f"{away} offense vs {home} D", f"{home} offense vs {away} D"],
+                                    default=f"{away} offense vs {home} D")
+        off, dfn = (home, away) if side and side.startswith(home) else (away, home)
+        o = offense.loc[off] if off in offense.index else pd.Series(dtype=float)
+        d = defense.loc[dfn]
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            ui.section(f"{off} offense")
+            metric_grid([
+                ("Plays / game", o.get("plays_per_game"), offense.plays_per_game.mean(), "num"),
+                ("Neutral pass rate", o.get("neutral_pass_rate"), offense.neutral_pass_rate.mean(), "pct"),
+                ("EPA / play", o.get("epa_per_play"), offense.epa_per_play.mean(), "epa"),
+                ("Shotgun", o.get("shotgun_rate"), offense.shotgun_rate.mean(), "pct"),
+                ("Motion", o.get("motion_rate"), offense.motion_rate.mean(), "pct"),
+                ("Play-action", o.get("play_action_rate"), offense.play_action_rate.mean(), "pct"),
+            ])
+            st.caption(f"Personnel groupings ({pers_season})")
+            mix = model.formation_mix(data, off, "offense").head(6)
+            st.dataframe(mix, width="stretch", column_config=PERSONNEL_COLS,
+                         column_order=["plays", "share", "pass_rate", "success_rate", "epa_per_play"])
+        with c2:
+            ui.section(f"{dfn} defense")
+            metric_grid([
+                ("Blitz rate", d.get("blitz_rate"), defense.blitz_rate.mean(), "pct"),
+                ("Men in box", d.get("avg_box"), defense.avg_box.mean(), "num"),
+                (f"Man coverage ({pers_season})", d.get("man_rate"), defense.get("man_rate", pd.Series(dtype=float)).mean(), "pct"),
+                (f"Pressure rate ({pers_season})", d.get("pressure_rate"),
+                 defense.get("pressure_rate", pd.Series(dtype=float)).mean(), "pct"),
+                ("Deep yds / att allowed", d.get("deep_ypa_allowed"), defense.deep_ypa_allowed.mean(), "num"),
+                ("10+ yd runs allowed", d.get("explosive_run_rate"), defense.explosive_run_rate.mean(), "pct"),
+            ])
+            if "top_coverage" in defense and pd.notna(d.get("top_coverage")):
+                st.caption(f"Most-used coverage ({pers_season}): **{d.top_coverage}**")
+            st.caption(f"Sub-packages ({pers_season})")
+            st.dataframe(model.formation_mix(data, dfn, "defense"), width="stretch", column_config=PERSONNEL_COLS,
+                         column_order=["plays", "share", "pass_rate", "success_rate", "epa_per_play"])
+        ui.section(f"What {dfn} allows (fantasy pts / game, rank 1 = most generous)")
+        pcols = st.columns(5)
+        for col, p in zip(pcols, ["QB", "RB", "WR", "TE", "K"]):
+            col.metric(p, f"{d[f'{p}_pts_allowed']:.1f}", f"#{d[f'{p}_rank']} of {len(defense)}", delta_color="off")
+        ui.section(f"{off} players this week")
+        table(proj[proj.team == off].head(12))
+
+# ---------------------------------------------------------------- weather
+with tab_wx:
+    if fc.empty:
+        st.warning("No games found for this week.")
+    else:
+        order = fc.assign(bad=fc.tags.map(lambda t: any(c in weather.ADVERSE for c in t))) \
+                  .sort_values(["bad", "kickoff"], ascending=[False, True])
+        rows = list(order.iterrows())
+        for start in range(0, len(rows), 4):
+            for col, (_, f) in zip(st.columns(4), rows[start:start + 4]):
+                col.markdown(ui.weather_card(f, teams), unsafe_allow_html=True)
+        st.caption("Forecasts from Open-Meteo for the 3 hours after kickoff, refreshed hourly. They appear about "
+                   "2 weeks out and firm up 2–3 days before the game — check again before lineups lock.")
+
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        ui.section(f"Weather vs scoring since {weather.HISTORY_START}")
+        st.bar_chart(league_wx.drop(index="Normal outdoor").vs_normal.rename("Total pts vs normal outdoor game"),
+                     horizontal=True, color="#3DDC84", height=260)
+        st.caption(" · ".join(f"{c}: {int(g)} games" for c, g in league_wx.games.items()))
+    with c2:
+        ui.section("Fantasy multiplier by position")
+        st.dataframe(effects.mult.unstack().reindex(model.POSITIONS)
+                     .rename(index={"DST": "D/ST"}, columns=lambda c: f"{ui.WX_ICON.get(c, '')} {c}")
+                     .style.format("{:.2f}").background_gradient(cmap=ui.CMAP, vmin=0.88, vmax=1.12), width="stretch")
+        st.caption("Applied to projections when the forecast matches. Based on the last two seasons and pulled "
+                   "toward 1.00 when the sample is small.")
+
+    ui.section("Team weather splits")
+    cond = st.segmented_control("Condition", weather.CONDITIONS, default=weather.WINDY,
+                                format_func=lambda c: f"{ui.WX_ICON.get(c, '')} {c}") or weather.WINDY
+    t = tsplits.xs(cond, level="condition").sort_values("ppg_diff", ascending=False)
+    t = t.assign(logo=[teams.logo(x) for x in t.index])[["logo", "games", "ppg", "ppg_diff", "allowed", "allowed_diff"]]
+    st.dataframe(t.style.format({"ppg": "{:.1f}", "allowed": "{:.1f}", "ppg_diff": "{:+.1f}", "allowed_diff": "{:+.1f}"})
+                 .background_gradient(subset=["ppg_diff"], cmap=ui.CMAP, vmin=-8, vmax=8)
+                 .background_gradient(subset=["allowed_diff"], cmap=ui.CMAP.reversed(), vmin=-8, vmax=8),
+                 width="stretch", height=560, column_config={
+                     "logo": st.column_config.ImageColumn("", width="small"), "games": "Games", "ppg": "Pts / gm",
+                     "ppg_diff": "Pts vs norm", "allowed": "Allowed / gm", "allowed_diff": "Allowed vs norm"})
+    st.caption(f"“vs norm” compares with the same team's average in all games since {weather.HISTORY_START}. "
+               "Fewer than ~5 games is mostly noise.")
+
+# ---------------------------------------------------------------- defenses
+with tab_def:
+    cols = {"blitz_rate": "Blitz %", "avg_pass_rushers": "Rushers", "avg_box": "Box", "man_rate": "Man %",
+            "pressure_rate": "Pressure %", "Nickel (5 DB)": "Nickel %", "Dime+ (6+ DB)": "Dime %",
+            "top_coverage": "Top coverage", "pass_epa_allowed": "Pass EPA", "rush_epa_allowed": "Rush EPA",
+            **{f"{p}_pts_allowed": f"{p} pts" for p in model.POSITIONS},
+            "DST_pts_allowed": "D/ST pts (vs this offense)"}
+    t = defense[[c for c in cols if c in defense]].rename(columns=cols)
+    t.insert(0, "logo", [teams.logo(x) for x in t.index])
+    pct = [c for c in ["Blitz %", "Man %", "Pressure %", "Nickel %", "Dime %"] if c in t]
+    pts = [cols[f"{p}_pts_allowed"] for p in model.POSITIONS]
+    st.dataframe(t.style.format({**{c: "{:.0%}" for c in pct}, "Rushers": "{:.2f}", "Box": "{:.2f}",
+                                 "Pass EPA": "{:+.3f}", "Rush EPA": "{:+.3f}", **{c: "{:.1f}" for c in pts}}, na_rep="–")
+                 .background_gradient(subset=pts, cmap=ui.CMAP),
+                 width="stretch", height=1180, column_config={"logo": st.column_config.ImageColumn("", width="small")})
+    st.caption(f"Blitz and box counts from {season} FTN charting. Man %, pressure, nickel/dime and coverage from "
+               f"{pers_season} NFL participation data (the latest published). Green = more fantasy points allowed. "
+               "The D/ST column is how many points opposing defenses score against this team's offense.")
+
+st.caption("Data: nflverse (play-by-play, FTN charting, participation, rosters, schedules & Vegas lines) · "
+           "Weather: Open-Meteo · Logos & headshots: ESPN / NFL.")
