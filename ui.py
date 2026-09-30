@@ -355,3 +355,9 @@ def mult_color(v):
     if pd.isna(v):
         return ""
     return f"color: {GOOD}" if v >= 1.03 else f"color: {BAD}" if v <= 0.97 else f"color: {MUTED}"
+
+
+def sign_color(v):
+    if pd.isna(v) or v == 0:
+        return ""
+    return f"color: {GOOD}; font-weight: 600" if v > 0 else f"color: {BAD}; font-weight: 600"

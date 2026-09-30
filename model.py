@@ -453,7 +453,8 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
     df = df.sort_values("proj", ascending=False)
     ctx = {"defense": defense, "offense": offense, "schedule": sched, "fp_cur": fp_cur, "fp_all": fp_all,
            "coverage_splits": receiver_coverage_splits(data), "info": info,
-           "ftn_through": int(fp_cur[fp_cur.game_id.isin(tq.game_id)].week.max()) if len(tq) else None}
+           "ftn_through": int(fp_cur[fp_cur.game_id.isin(tq.game_id)].week.max()) if len(tq) else None,
+           "target_quality": (tq, team_first)}
     return df, ctx
 
 
@@ -512,6 +513,98 @@ def matchup_notes(r: pd.Series, ctx: dict) -> list[str]:
     if pd.notna(d.get("Nickel (5 DB)")) and r.position in ("WR", "TE"):
         notes.append(f"{r.opp} is in nickel {d['Nickel (5 DB)']:.0%} / dime {d['Dime+ (6+ DB)']:.0%} of snaps.")
     return notes
+
+
+# ---------------------------------------------------------------- usage shifts
+SHIFT_METRICS = {"Target share": ("targets", "targets", ["RB", "WR", "TE"]),
+                 "Carry share": ("carries", "carries", ["QB", "RB", "WR", "TE"]),
+                 "First-read share": ("first_reads", "first reads", ["RB", "WR", "TE"])}
+
+
+def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_game: float = 2.0) -> pd.DataFrame:
+    """RB/WR/TE whose target, carry or first-read share over their team's last `window` games moved at least
+    `threshold` from the rest of the season. Shares only count games the player recorded a stat in, and a change
+    is skipped when the player never averaged `min_per_game` of that stat in either stretch."""
+    fp, info = ctx["fp_cur"], ctx["info"]
+    tq, team_first = ctx["target_quality"]
+    if fp.empty:
+        return pd.DataFrame()
+    g = fp[~fp.player_id.str.startswith("DST_")][["player_id", "team", "game_id", "week", "targets", "carries"]]
+    g = g.merge(tq[["player_id", "team", "game_id", "first_reads"]] if len(tq) else
+                pd.DataFrame(columns=["player_id", "team", "game_id", "first_reads"]),
+                on=["player_id", "team", "game_id"], how="left")
+    g["first_reads"] = g.first_reads.fillna(0)
+    team = g.groupby(["team", "game_id", "week"], as_index=False)[["targets", "carries"]].sum()
+    team["first_reads"] = [team_first.get((t, gid), np.nan) for t, gid in zip(team.team, team.game_id)]
+    team["recent"] = team.groupby("team").week.rank(ascending=False) <= window
+    g = g.merge(team.rename(columns={"targets": "t_targets", "carries": "t_carries", "first_reads": "t_first_reads"}),
+                on=["team", "game_id", "week"])
+    stats = ["targets", "carries", "first_reads", "t_targets", "t_carries", "t_first_reads"]
+    agg = g.groupby(["player_id", "team", "recent"])[stats].sum(min_count=1)
+    agg["games"] = g.groupby(["player_id", "team", "recent"]).size()
+    before = agg.xs(False, level="recent")
+    after = agg.xs(True, level="recent")
+    both = after.join(before, lsuffix="_a", rsuffix="_b", how="outer")
+    both = both.join(info[["name", "position", "status"]], on="player_id")
+
+    def share(row, col, suffix):
+        tot = row[f"t_{col}_{suffix}"]
+        return row[f"{col}_{suffix}"] / tot if pd.notna(tot) and tot > 0 else np.nan
+
+    for label, (col, _, _) in SHIFT_METRICS.items():
+        both[f"{col}_share_a"] = [share(r, col, "a") for _, r in both.iterrows()]
+        both[f"{col}_share_b"] = [share(r, col, "b") for _, r in both.iterrows()]
+
+    def reason(pid, tm, r, col, unit, group, change):
+        mates = both.xs(tm, level="team").drop(index=pid, errors="ignore")
+        mates = mates[mates.position.isin(group)]
+        # The teammate whose share moved most the other way explains it best. No stat in a window counts as 0%.
+        sa, sb = mates[f"{col}_share_a"], mates[f"{col}_share_b"]
+        swing = sa.where(mates.games_a.notna(), 0) - sb.where(mates.games_b.notna(), 0)
+        swing = swing[np.sign(swing) == -np.sign(change)].dropna()
+        if len(swing) and swing.abs().max() < abs(change) / 2 and (swing.abs() >= 0.05).sum() >= 2:
+            fmt = lambda s: f"{s:.0%}" if pd.notna(s) else "0%"
+            top = [mates.loc[i] for i in swing.abs().nlargest(2).index]
+            return f"{'Spread out' if change < 0 else 'Pulled from several players'} — " + ", ".join(
+                f"{m['name']} ({m.position}) {fmt(m[f'{col}_share_b'])} → {fmt(m[f'{col}_share_a'])}" for m in top) \
+                + f" of {unit}."
+        if len(swing) and swing.abs().max() >= 0.05:
+            m = mates.loc[swing.abs().idxmax()]
+            who = f"{m['name']} ({m.position})"
+            if pd.isna(m.games_a):
+                ir = ", now on IR," if m.status == "RES" else ""
+                return (f"{who}{ir} hasn't recorded a stat in the last {window} games after getting "
+                        f"{m[f'{col}_share_b']:.0%} of {tm}'s {unit} before.")
+            if pd.isna(m.games_b):
+                return f"{who} joined the mix, taking {m[f'{col}_share_a']:.0%} of {unit} over the last {window}."
+            way = "away from" if change > 0 else "to"
+            return (f"Work shifting {way} {who}: {m[f'{col}_share_b']:.0%} → "
+                    f"{m[f'{col}_share_a']:.0%} of {unit}.")
+        own_a, own_b = r[f"{col}_a"] / r.games_a, r[f"{col}_b"] / r.games_b
+        tot_a, tot_b = r[f"t_{col}_a"] / r.games_a, r[f"t_{col}_b"] / r.games_b
+        return (f"{own_a:.1f} {unit}/gm over the last {window} vs {own_b:.1f} before, on {tot_a:.0f} vs "
+                f"{tot_b:.0f} team {unit}/gm — {'a bigger' if change > 0 else 'a smaller'} slice, not just "
+                f"{'more' if change > 0 else 'less'} team volume." if abs(tot_a - tot_b) / max(tot_b, 1) < 0.15 else
+                f"{own_a:.1f} {unit}/gm over the last {window} vs {own_b:.1f} before; team {unit}/gm went "
+                f"{tot_b:.0f} → {tot_a:.0f}.")
+
+    rows = []
+    for (pid, tm), r in both[both.position.isin(["RB", "WR", "TE"])].iterrows():
+        if pd.isna(r.games_a) or pd.isna(r.games_b):
+            continue
+        for label, (col, unit, group) in SHIFT_METRICS.items():
+            a, b = r[f"{col}_share_a"], r[f"{col}_share_b"]
+            if pd.isna(a) or pd.isna(b) or abs(a - b) < threshold:
+                continue
+            if max(r[f"{col}_a"] / r.games_a, r[f"{col}_b"] / r.games_b) < min_per_game:
+                continue  # e.g. 0 -> 1 target: a big share swing on almost no volume
+            rows.append({"player_id": pid, "name": r["name"], "position": r.position, "team": tm, "metric": label,
+                         "last": a, "before": b, "change": a - b, "games_last": int(r.games_a),
+                         "games_before": int(r.games_b), "reason": reason(pid, tm, r, col, unit, group, a - b)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.reindex(out.change.abs().sort_values(ascending=False).index).reset_index(drop=True)
 
 
 def optimize_lineup(players: pd.DataFrame, slots: dict) -> pd.DataFrame:

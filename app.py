@@ -207,6 +207,11 @@ def get_projections(season: int, ppr: float, week: int):
     return model.project(get_data(season), ppr, week)
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner="Finding usage shifts…")
+def get_usage_shifts(season: int, ppr: float, week: int):
+    return model.usage_shifts(get_projections(season, ppr, week)[1])
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner="Loading weather history (first run takes a minute or two)…")
 def get_weather_history(season: int):
     d = get_data(season)
@@ -456,8 +461,8 @@ def metric_grid(items: list, ncols: int = 3):
             cols[i % ncols].metric(lab, fmt[kind](v), dfmt[kind](v - lg) if pd.notna(lg) else None, delta_color="off")
 
 
-tab_lineup, tab_rank, tab_game, tab_wx, tab_def = st.tabs(
-    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses"])
+tab_lineup, tab_rank, tab_shift, tab_game, tab_wx, tab_def = st.tabs(
+    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "📈 Usage Shifts", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses"])
 
 # ---------------------------------------------------------------- my lineup
 with tab_lineup:
@@ -515,6 +520,46 @@ with tab_rank:
                f"**1st-read %, Catchable %, Contested %, Drops** come from {season} FTN charting"
                + (f" (through Week {ftn_through})" if ftn_through else "") + ": first-read share is how often the "
                "QB's first read was this player, out of the team's first-read throws in games they played.")
+
+# ---------------------------------------------------------------- usage shifts
+with tab_shift:
+    shifts = get_usage_shifts(season, ppr, week)
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        spos = st.segmented_control("Position", ["All", "RB", "WR", "TE"], default="All", key="shift_pos") or "All"
+    with c2:
+        smetric = st.segmented_control("Share", ["All"] + list(model.SHIFT_METRICS), default="All",
+                                       key="shift_metric") or "All"
+    if shifts.empty:
+        st.info("No usage changes of 8+ points yet — this needs at least 3 games played.")
+    else:
+        v = shifts
+        if spos != "All":
+            v = v[v.position == spos]
+        if smetric != "All":
+            v = v[v.metric == smetric]
+        up, down = int((v.change > 0).sum()), int((v.change < 0).sum())
+        st.caption(f"**{len(v)} changes** · {up} up · {down} down · biggest first")
+        info_cols = ctx["info"].reindex(v.player_id)
+        out = pd.DataFrame({
+            "photo": [photo(r) for _, r in info_cols.assign(team=v.team.values).iterrows()],
+            "Player": v.name.values, "Pos": v.position.values, "Team": v.team.values, "Share": v.metric.values,
+            "Before": v.before.values, "Last 2": v["last"].values, "Change": v.change.values,
+            "Why": v.reason.values})
+        st.dataframe(out.style.map(ui.sign_color, subset=["Change"]).format(
+                         {"Before": "{:.0%}", "Last 2": "{:.0%}", "Change": lambda x: f"{x * 100:+.0f} pts"}),
+                     hide_index=True, width="stretch", height=min(40 + 35 * len(out), 760), column_config={
+                         "photo": st.column_config.ImageColumn("", width="small"),
+                         "Player": st.column_config.TextColumn("Player", width="medium"),
+                         "Why": st.column_config.TextColumn("Why", width="large")})
+    before_games = int(played_through) - 2 if played_through else 0
+    st.caption(
+        f"Share of team targets, carries and first-read throws over each team's **last 2 games** vs the rest of the "
+        f"{season} season, counting only games the player recorded a stat in. Changes of 8+ points are listed; ones "
+        "where the player never averaged 2+ of that stat per game are skipped. First-read share comes from "
+        f"{season} FTN charting. \"Why\" names the teammate whose share moved most the other way."
+        + (f"  \n⚠️ Only {before_games} earlier game{'s' * (before_games != 1)} to compare against so far — expect "
+           "big swings until the sample grows." if 0 < before_games < 3 else ""))
 
 # ---------------------------------------------------------------- game breakdown
 with tab_game:
