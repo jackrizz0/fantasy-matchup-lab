@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import time
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -210,6 +211,12 @@ def get_projections(season: int, ppr: float, week: int):
 @st.cache_data(ttl=6 * 3600, show_spinner="Finding usage shifts…")
 def get_usage_shifts(season: int, ppr: float, week: int):
     return model.usage_shifts(get_projections(season, ppr, week)[1])
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Backtesting every completed week…")
+def get_backtest(season: int, ppr: float, through: int):
+    """`through` (latest week with stats) is only part of the cache key, so a new week triggers a fresh run."""
+    return model.backtest(get_data(season), ppr)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Loading weather history (first run takes a minute or two)…")
@@ -461,8 +468,9 @@ def metric_grid(items: list, ncols: int = 3):
             cols[i % ncols].metric(lab, fmt[kind](v), dfmt[kind](v - lg) if pd.notna(lg) else None, delta_color="off")
 
 
-tab_lineup, tab_rank, tab_shift, tab_game, tab_wx, tab_def = st.tabs(
-    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "📈 Usage Shifts", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses"])
+tab_lineup, tab_rank, tab_shift, tab_game, tab_wx, tab_def, tab_score = st.tabs(
+    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "📈 Usage Shifts", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses",
+     "🎯 Model Scorecard"])
 
 # ---------------------------------------------------------------- my lineup
 with tab_lineup:
@@ -710,6 +718,110 @@ with tab_def:
     st.caption(f"Blitz and box counts from {season} FTN charting. Man %, pressure, nickel/dime and coverage from "
                f"{pers_season} NFL participation data (the latest published). Green = more fantasy points allowed. "
                "The D/ST column is how many points opposing defenses score against this team's offense.")
+
+# ---------------------------------------------------------------- model scorecard
+with tab_score:
+    st.markdown("How well has Matchup Lab projected this season? Each completed week is re-projected using **only "
+                "plays from the weeks before it**, then compared with what actually happened — and with a simple "
+                "baseline: each player's season average going into the week.")
+    if not st.session_state.get("scorecard_on"):
+        st.button("Run the backtest", type="primary", on_click=lambda: st.session_state.update(scorecard_on=True))
+        st.caption("Takes a few seconds the first time; results are then cached.")
+    else:
+        bt, bt_log = get_backtest(season, ppr, played_through)
+        if bt.empty:
+            st.info("No completed weeks to score yet.")
+        else:
+            overall = model.scorecard(bt, None).iloc[0]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Weeks scored", f"{bt.week.nunique()}", f"Weeks {bt.week.min()}–{bt.week.max()}",
+                      delta_color="off")
+            m2.metric("Avg miss (MAE)", f"{overall.mae:.2f} pts",
+                      f"{overall.mae - overall.base_mae:+.2f} vs season avg ({overall.base_mae:.2f})",
+                      delta_color="inverse", help="Mean absolute error per player-game, fantasy-relevant players.")
+            m3.metric("Start/sit hit rate", f"{overall.start_hit:.0%}",
+                      f"{(overall.start_hit - overall.base_start_hit) * 100:+.0f} pts vs season avg "
+                      f"({overall.base_start_hit:.0%})", help="Of the players projected as starters (top 12 QB/TE/K/"
+                      "D/ST, top 24 RB, top 36 WR each week), the share who finished as one.")
+            m4.metric("Bias", f"{overall.bias:+.2f} pts", "projects high" if overall.bias > 0.5 else
+                      "projects low" if overall.bias < -0.5 else "about even", delta_color="off",
+                      help="Average of projection − actual. Positive means projections run high.")
+
+            score_cols = {
+                "players": st.column_config.NumberColumn("Player-games"),
+                "mae": st.column_config.NumberColumn("Model MAE"),
+                "base_mae": st.column_config.NumberColumn("Season-avg MAE"),
+                "gain": st.column_config.NumberColumn("Error cut", help="How much smaller the model's average miss "
+                                                      "is than the season-average baseline's."),
+                "bias": st.column_config.NumberColumn("Bias"),
+                "start_hit": st.column_config.NumberColumn("Start/sit (model)"),
+                "base_start_hit": st.column_config.NumberColumn("Start/sit (season avg)"),
+            }
+            order = list(score_cols)
+
+            def score_style(t: pd.DataFrame):
+                t = t.rename_axis(None)
+                return t.style.map(ui.sign_color, subset=["gain"]).format(
+                    {"players": "{:.0f}", "mae": "{:.2f}", "base_mae": "{:.2f}", "gain": "{:+.0%}", "bias": "{:+.2f}",
+                     "start_hit": "{:.0%}", "base_start_hit": "{:.0%}"}, na_rep="–")
+            c1, c2 = st.columns([3, 2], gap="large")
+            with c1:
+                ui.section("By position")
+                by_pos = model.scorecard(bt, "position").reindex(model.POSITIONS).rename(index={"DST": "D/ST"})
+                st.dataframe(score_style(by_pos), width="stretch",
+                             column_config=score_cols, column_order=order)
+            with c2:
+                ui.section("By week")
+                by_week = model.scorecard(bt, "week").rename(index=lambda w: f"Week {w}")
+                st.dataframe(score_style(by_week), width="stretch",
+                             column_config=score_cols, column_order=["mae", "base_mae", "gain", "start_hit"])
+
+            ui.section("Biggest misses")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                mpos = st.segmented_control("Position", ["All"] + model.POSITIONS, default="All", key="miss_pos",
+                                            format_func=lambda p: SLOT_LABELS.get(p, p)) or "All"
+            with c2:
+                mkind = st.segmented_control("Show", ["All misses", "Start/sit misses"], default="All misses",
+                                             key="miss_kind") or "All misses"
+            miss = bt[bt.relevant]
+            if mpos != "All":
+                miss = miss[miss.position == mpos]
+            call = np.select([miss.start & ~miss.should_start, ~miss.start & miss.should_start],
+                             ["Busted start", "Missed sleeper"], "")
+            miss = miss.assign(call=call)
+            if mkind == "Start/sit misses":
+                miss = miss[miss.call != ""]
+            miss = miss.reindex(miss.error.abs().sort_values(ascending=False).index).head(40)
+            st.dataframe(pd.DataFrame({
+                "Week": miss.week.values, "Player": miss.name.values, "Pos": miss.position.values,
+                "Team": miss.team.values, "Opp": miss.opp.values, "Proj": miss.proj.values,
+                "Season avg": miss.baseline.values, "Actual": miss.actual.values, "Miss": miss.error.values,
+                "Start/sit": miss.call.values}).style.map(lambda v: ui.sign_color(-v), subset=["Miss"]).format(
+                    {"Proj": "{:.1f}", "Season avg": "{:.1f}", "Actual": "{:.1f}", "Miss": "{:+.1f}"}),
+                hide_index=True, width="stretch", height=min(40 + 35 * len(miss), 720))
+            st.caption("**Miss** = projection − actual (negative: the player beat the projection). **Busted start** "
+                       "= projected as a starter but finished outside the top group; **Missed sleeper** = the reverse.")
+
+            with st.expander("How this is tested — and how we know it can't see the future"):
+                st.markdown(
+                    f"- For each completed week, current-season play-by-play, FTN charting and participation rows are "
+                    f"cut to **earlier weeks only** before `project()` runs. Last season's data and each game's "
+                    f"pregame Vegas lines are allowed — both were known before kickoff.\n"
+                    "- Each player's team is the one they played for that week (known at kickoff), not today's "
+                    "roster, and today's injury/roster status isn't used.\n"
+                    "- Weather adjustments aren't applied here (past forecasts aren't stored), so these are the "
+                    "projections before the weather multiplier.\n"
+                    "- Scored on players who played that week and whom either method ranked inside twice the starter "
+                    "count at their position — chosen with pregame info only, so neither method gets to pick.\n"
+                    "- `tests/test_backtest_leakage.py` scrambles every play from the target week onward and checks "
+                    "the projections don't change at all.")
+                log = bt_log.assign(latest_week=bt_log.latest_week.map(
+                    lambda w: "— (last season only)" if pd.isna(w) else f"Week {int(w)}"))
+                st.dataframe(log.rename(columns={"week": "Week projected", "plays": f"{season} plays used",
+                                                 "latest_week": "Latest week used", "ftn_rows": "FTN rows used",
+                                                 "ftn_ok": "FTN rows all from earlier games"}),
+                             hide_index=True, width="stretch")
 
 st.caption("Data: [nflverse](https://github.com/nflverse) (play-by-play, participation, rosters, schedules & Vegas "
            "lines) · Charting data: [FTN Data](https://ftndata.com), licensed "
