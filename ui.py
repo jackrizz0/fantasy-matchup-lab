@@ -207,6 +207,13 @@ def _tone(mult, hi=1.04, lo=0.96) -> str:
     return "good" if mult >= hi else "bad" if mult <= lo else ""
 
 
+def _strftime(ts, fmt: str) -> str:
+    """strftime that also understands %-d / %-m / %-I (no leading zero) on Windows, not just Linux/macOS."""
+    for code in "dmI":
+        fmt = fmt.replace(f"%-{code}", str(int(ts.strftime(f"%{code}"))))
+    return ts.strftime(fmt)
+
+
 def pct(p: float, live: bool = False) -> str:
     """Percent label; while a game is still going, never claim 0% or 100%."""
     if live:
@@ -233,7 +240,7 @@ def scoreboard_strip(wp: pd.DataFrame, teams: Teams) -> str:
         elif g.state == "post":
             status = f"<span>{escape(g.detail)}</span>"
         else:
-            status = f'<span>{g.kickoff.strftime("%a %-I:%M %p")}</span>'
+            status = f'<span>{_strftime(g.kickoff, "%a %-I:%M %p")}</span>'
         hp = g.home_win if g.home_win is not None and pd.notna(g.home_win) else None
         rows = ""
         for side, score, p in (("away", g.away_score, None if hp is None else 1 - hp), ("home", g.home_score, hp)):
@@ -261,7 +268,7 @@ def player_card(r: pd.Series, slot: str | None, teams: Teams, fc_row, defense: p
     meta = f'{escape(str(r.team))} · {escape(r.position)}'
     if not bye:
         meta += f' · vs <img src="{teams.logo(r.opp)}" alt=""> {escape(str(r.opp))}'
-    when = "BYE WEEK" if bye else (fc_row.kickoff.strftime("%a %-I:%M %p") if fc_row is not None else "")
+    when = "BYE WEEK" if bye else (_strftime(fc_row.kickoff, "%a %-I:%M %p") if fc_row is not None else "")
     chips = []
     if not bye and r.opp in defense.index:
         rank = defense.at[r.opp, f"{r.position}_rank"]
@@ -311,7 +318,7 @@ def game_banner(away: str, home: str, teams: Teams, sched: pd.DataFrame, fc_row,
     elif g is not None and g.state == "post":
         center.append(escape(g.detail))
     elif fc_row is not None:
-        center.append(fc_row.kickoff.strftime("%a %-m/%-d · %-I:%M %p ET"))
+        center.append(_strftime(fc_row.kickoff, "%a %-m/%-d · %-I:%M %p ET"))
     if fc_row is not None:
         center.append(escape(str(fc_row.stadium)))
         if fc_row.tags:
@@ -325,7 +332,7 @@ def game_banner(away: str, home: str, teams: Teams, sched: pd.DataFrame, fc_row,
 
 def weather_card(f: pd.Series, teams: Teams) -> str:
     adverse = [t for t in f.tags if t in weather.ADVERSE]
-    when = f.kickoff.strftime("%a %-I:%M %p ET")
+    when = _strftime(f.kickoff, "%a %-I:%M %p ET")
     if weather.INDOORS in f.tags:
         big, det = "🏟️ Indoors", f"{escape(str(f.roof).title())} roof — no weather impact"
     elif pd.notna(f.get("temp")):
