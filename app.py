@@ -323,6 +323,7 @@ proj["win_prob"] = proj.team.map(lambda t: team_wp.get(t, (None, None))[0]).asty
 proj["win_source"] = proj.team.map(lambda t: team_wp.get(t, (None, None))[1])
 defense, offense, sched = ctx["defense"], ctx["offense"], ctx["schedule"]
 pers_season = defense.attrs.get("personnel_season")
+ftn_through = ctx.get("ftn_through")
 label = lambda pid: f"{proj.at[pid, 'name']} ({proj.at[pid, 'position']}, {proj.at[pid, 'team']})"
 
 
@@ -340,7 +341,8 @@ ui.hero(f"{season} season · {scoring}", "MATCHUP LAB",
         str(week), "week",
         [f"🔴 {live_now} live now" if live_now else f"🏈 {len(sched) // 2} games this week",
          f"🌦️ {wx_games} weather games" if wx_games else "☀️ No weather concerns",
-         f"📊 Stats through Week {played_through}", f"🧩 Personnel data: {pers_season}"])
+         f"📊 Stats through Week {played_through}", f"🧩 Personnel data: {pers_season}"]
+        + ([f"📝 Charting: {season} thru Wk {ftn_through}"] if ftn_through else []))
 
 
 @st.fragment(run_every=30 if live_now else None)
@@ -355,6 +357,8 @@ live_scoreboard()
 DISPLAY = {"name": "Player", "position": "Pos", "team": "Team", "opp": "Opp", "proj": "Proj",
            "ppg": f"{season} PPG", "last3": "Last 3", "ppg_prev": f"{season - 1} PPG",
            "tgt_share": "Tgt %", "carry_share": "Carry %", "adot": "aDOT", "rz": "RZ opps",
+           "first_read_share": "1st-read %", "catchable_rate": "Catchable %", "contested_rate": "Contested %",
+           "drops": "Drops",
            "dvp_mult": "Matchup ×", "scheme_mult": "Scheme ×", "env_mult": "Vegas ×", "weather_mult": "Weather ×",
            "implied_total": "Implied pts", "win_prob": "Win %", "weather": "Weather"}
 PERSONNEL_COLS = {
@@ -365,6 +369,13 @@ PERSONNEL_COLS = {
     "epa_per_play": st.column_config.NumberColumn("EPA / play", format="%+.2f"),
 }
 MULTS = ["Matchup ×", "Scheme ×", "Vegas ×", "Weather ×"]
+TQ_HELP = {
+    "1st-read %": f"Share of the team's first-read throws that went to this player, in games they played "
+                  f"({season} FTN charting).",
+    "Catchable %": f"Share of this player's targets that were catchable balls ({season} FTN charting).",
+    "Contested %": f"Share of this player's targets thrown into tight coverage ({season} FTN charting).",
+    "Drops": f"Charted drops this season ({season} FTN charting).",
+}
 
 
 def photo(r) -> str:
@@ -375,11 +386,15 @@ def table(df: pd.DataFrame, height: int | str = "auto"):
     view = df.assign(photo=[photo(r) for _, r in df.iterrows()])
     out = view[["photo"] + [c for c in DISPLAY if c in view]].rename(columns=DISPLAY)
     mults = [m for m in MULTS if m in out]
-    styled = out.style.map(ui.mult_color, subset=mults).format({m: "{:.2f}" for m in mults}, na_rep="–")
+    rates = [c for c in ["1st-read %", "Catchable %", "Contested %"] if c in out]
+    styled = out.style.map(ui.mult_color, subset=mults).format(
+        {**{m: "{:.2f}" for m in mults}, **{c: "{:.0%}" for c in rates},
+         **({"Drops": "{:.0f}"} if "Drops" in out else {})}, na_rep="–")
     pct = {c: st.column_config.ProgressColumn(c, format="percent", min_value=0, max_value=1)
            for c in ["Tgt %", "Carry %", "Win %"]}
     nums = {c: st.column_config.NumberColumn(c, format="%.1f")
             for c in [f"{season} PPG", "Last 3", f"{season - 1} PPG", "aDOT", "Implied pts"]}
+    nums |= {c: st.column_config.NumberColumn(c, help=h) for c, h in TQ_HELP.items()}
     st.dataframe(styled, hide_index=True, width="stretch", height=height, column_config={
         "photo": st.column_config.ImageColumn("", width="small"),
         "Player": st.column_config.TextColumn("Player", width="medium"),
@@ -496,7 +511,10 @@ with tab_rank:
     st.caption("**Proj** = blended points per game (this season, with last season as a prior) × **Matchup** "
                "(opponent points allowed to the position) × **Scheme** (opponent efficiency vs pass/run) × "
                "**Vegas** (implied team total) × **Weather** (how the position scores in the forecast conditions). "
-               "Green multipliers help, red ones hurt.")
+               "Green multipliers help, red ones hurt.  \n"
+               f"**1st-read %, Catchable %, Contested %, Drops** come from {season} FTN charting"
+               + (f" (through Week {ftn_through})" if ftn_through else "") + ": first-read share is how often the "
+               "QB's first read was this player, out of the team's first-read throws in games they played.")
 
 # ---------------------------------------------------------------- game breakdown
 with tab_game:
@@ -526,9 +544,18 @@ with tab_game:
         off, dfn = (home, away) if side and side.startswith(home) else (away, home)
         o = offense.loc[off] if off in offense.index else pd.Series(dtype=float)
         d = defense.loc[dfn]
+        cur_tag = f"{season}" + (f", Wk 1–{ftn_through}" if ftn_through else "")
+        legend = (f"**{season}** stats are this season's play-by-play and FTN charting"
+                  + (f" (through Week {ftn_through})" if ftn_through else "") + ".")
+        if pers_season != season:
+            legend += (f" Stats marked **{pers_season}** (personnel groupings, man/zone, pressure, coverage and "
+                       f"sub-packages) come from last season's NFL participation data — {season} participation "
+                       "hasn't been published yet.")
+        st.info(legend, icon="🗓️")
+        mix_order = ["plays", "share", "pass_rate", "success_rate", "epa_per_play"]
         c1, c2 = st.columns(2, gap="large")
         with c1:
-            ui.section(f"{off} offense")
+            ui.section(f"{off} offense · {season}")
             metric_grid([
                 ("Plays / game", o.get("plays_per_game"), offense.plays_per_game.mean(), "num"),
                 ("Neutral pass rate", o.get("neutral_pass_rate"), offense.neutral_pass_rate.mean(), "pct"),
@@ -537,27 +564,41 @@ with tab_game:
                 ("Motion", o.get("motion_rate"), offense.motion_rate.mean(), "pct"),
                 ("Play-action", o.get("play_action_rate"), offense.play_action_rate.mean(), "pct"),
             ])
-            st.caption(f"Personnel groupings ({pers_season})")
+            st.caption(f"**Formation tendencies · {cur_tag}** (FTN charting)")
+            metric_grid([
+                ("Under center", o.get("under_center_rate"), offense.under_center_rate.mean(), "pct"),
+                ("Empty backfield", o.get("empty_rate"), offense.empty_rate.mean(), "pct"),
+                ("2+ backs", o.get("two_back_rate"), offense.two_back_rate.mean(), "pct"),
+                ("Pistol", o.get("pistol_rate"), offense.pistol_rate.mean(), "pct"),
+                ("Screens (of passes)", o.get("screen_rate"), offense.screen_rate.mean(), "pct"),
+                ("RPO", o.get("rpo_rate"), offense.rpo_rate.mean(), "pct"),
+            ])
+            st.dataframe(model.alignment_mix(data, off, "offense"), width="stretch", column_config=PERSONNEL_COLS,
+                         column_order=mix_order)
+            st.caption(f"**Personnel groupings · {pers_season}** (NFL participation data)")
             mix = model.formation_mix(data, off, "offense").head(6)
-            st.dataframe(mix, width="stretch", column_config=PERSONNEL_COLS,
-                         column_order=["plays", "share", "pass_rate", "success_rate", "epa_per_play"])
+            st.dataframe(mix, width="stretch", column_config=PERSONNEL_COLS, column_order=mix_order)
         with c2:
             ui.section(f"{dfn} defense")
             metric_grid([
-                ("Blitz rate", d.get("blitz_rate"), defense.blitz_rate.mean(), "pct"),
-                ("Men in box", d.get("avg_box"), defense.avg_box.mean(), "num"),
+                (f"Blitz rate ({season})", d.get("blitz_rate"), defense.blitz_rate.mean(), "pct"),
+                (f"Men in box ({season})", d.get("avg_box"), defense.avg_box.mean(), "num"),
                 (f"Man coverage ({pers_season})", d.get("man_rate"), defense.get("man_rate", pd.Series(dtype=float)).mean(), "pct"),
                 (f"Pressure rate ({pers_season})", d.get("pressure_rate"),
                  defense.get("pressure_rate", pd.Series(dtype=float)).mean(), "pct"),
-                ("Deep yds / att allowed", d.get("deep_ypa_allowed"), defense.deep_ypa_allowed.mean(), "num"),
-                ("10+ yd runs allowed", d.get("explosive_run_rate"), defense.explosive_run_rate.mean(), "pct"),
+                (f"Deep yds / att allowed ({season})", d.get("deep_ypa_allowed"), defense.deep_ypa_allowed.mean(), "num"),
+                (f"10+ yd runs allowed ({season})", d.get("explosive_run_rate"), defense.explosive_run_rate.mean(), "pct"),
             ])
+            st.caption(f"**vs offensive formations · {cur_tag}** (FTN charting) — what {dfn} has allowed by look")
+            st.dataframe(model.alignment_mix(data, dfn, "defense"), width="stretch", column_config=PERSONNEL_COLS,
+                         column_order=mix_order)
             if "top_coverage" in defense and pd.notna(d.get("top_coverage")):
                 st.caption(f"Most-used coverage ({pers_season}): **{d.top_coverage}**")
-            st.caption(f"Sub-packages ({pers_season})")
+            st.caption(f"**Sub-packages · {pers_season}** (NFL participation data)")
             st.dataframe(model.formation_mix(data, dfn, "defense"), width="stretch", column_config=PERSONNEL_COLS,
-                         column_order=["plays", "share", "pass_rate", "success_rate", "epa_per_play"])
+                         column_order=mix_order)
         ui.section(f"What {dfn} allows (fantasy pts / game, rank 1 = most generous)")
+        st.caption(f"{season} games, blended with {season - 1} as a prior while the sample is small.")
         pcols = st.columns(5)
         for col, p in zip(pcols, ["QB", "RB", "WR", "TE", "K"]):
             col.metric(p, f"{d[f'{p}_pts_allowed']:.1f}", f"#{d[f'{p}_rank']} of {len(defense)}", delta_color="off")

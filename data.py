@@ -26,7 +26,8 @@ PBP_COLUMNS = [
 PART_COLUMNS = ["nflverse_game_id", "play_id", "offense_personnel", "defense_personnel", "offense_formation",
                 "defense_man_zone_type", "defense_coverage_type", "was_pressure"]
 FTN_COLUMNS = ["nflverse_game_id", "nflverse_play_id", "n_blitzers", "n_pass_rushers", "n_defense_box",
-               "is_motion", "is_play_action"]
+               "is_motion", "is_play_action", "read_thrown", "is_catchable_ball", "is_contested_ball", "is_drop",
+               "is_screen_pass", "is_rpo", "qb_location", "n_offense_backfield"]
 NFLVERSE_FILES = ("play_by_play_*", "pbp_participation_*", "ftn_charting_*", "roster_*", "games.csv", "teams.csv")
 
 

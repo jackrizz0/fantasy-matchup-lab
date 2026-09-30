@@ -142,14 +142,37 @@ def dst_by_game(pbp: pd.DataFrame | None, games: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- team tendencies
+FTN_STATS = ["n_blitzers", "n_pass_rushers", "n_defense_box", "is_motion", "is_play_action", "read_thrown",
+             "is_catchable_ball", "is_contested_ball", "is_drop", "is_screen_pass", "is_rpo", "qb_location",
+             "n_offense_backfield"]
+QB_LOCATION = {"U": "Under center", "S": "Shotgun", "P": "Pistol"}
+
+
 def _join_ftn(pbp: pd.DataFrame, ftn: pd.DataFrame | None) -> pd.DataFrame:
     if ftn is None or ftn.empty:
-        return pbp.assign(n_blitzers=np.nan, n_pass_rushers=np.nan, n_defense_box=np.nan,
-                          is_motion=np.nan, is_play_action=np.nan)
-    cols = ["nflverse_game_id", "nflverse_play_id", "n_blitzers", "n_pass_rushers",
-            "n_defense_box", "is_motion", "is_play_action"]
-    f = ftn[cols].rename(columns={"nflverse_game_id": "game_id", "nflverse_play_id": "play_id"})
+        return pbp.assign(**{c: np.nan for c in FTN_STATS})
+    f = ftn[["nflverse_game_id", "nflverse_play_id"] + FTN_STATS] \
+        .rename(columns={"nflverse_game_id": "game_id", "nflverse_play_id": "play_id"})
+    f = f.assign(qb_location=f.qb_location.where(f.qb_location.isin(list(QB_LOCATION))))  # "0" = not charted
     return pbp.merge(f, on=["game_id", "play_id"], how="left")
+
+
+def target_quality_by_game(pbp: pd.DataFrame | None, ftn: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.Series]:
+    """FTN-charted targets per receiver per game (first reads, catchable, contested, drops), plus each team's
+    first-read throws per game — the denominator for first-read share."""
+    p = _join_ftn(_reg_plays(pbp), ftn)
+    p = p[p.read_thrown.notna()] if not p.empty else p
+    if p.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+    first = p.read_thrown.eq("1")
+    t = p[p.receiver_player_id.notna()].assign(
+        first_read=first, catchable=p.is_catchable_ball.eq(True), contested=p.is_contested_ball.eq(True),
+        drop=p.is_drop.eq(True))
+    per = t.groupby(["receiver_player_id", "posteam", "game_id"]).agg(
+        ftn_tgts=("first_read", "size"), first_reads=("first_read", "sum"), catchable=("catchable", "sum"),
+        contested=("contested", "sum"), drops=("drop", "sum")).reset_index()
+    team_first = p[first & (p.pass_attempt == 1)].groupby(["posteam", "game_id"]).size()
+    return per.rename(columns={"receiver_player_id": "player_id", "posteam": "team"}), team_first
 
 
 def _join_part(pbp: pd.DataFrame, part: pd.DataFrame | None) -> pd.DataFrame:
@@ -255,6 +278,13 @@ def offense_profile(data: dict) -> pd.DataFrame:
             "epa_per_play": d.epa.mean(),
             "sack_rate_allowed": _pct(d[d.qb_dropback == 1].sack),
             "giveaways_per_game": (d.interception.sum() + d.fumble_lost.sum()) / max(d.game_id.nunique(), 1),
+            # FTN formation charting (current season only).
+            "under_center_rate": _pct(d.qb_location.eq("U").where(d.qb_location.notna())),
+            "pistol_rate": _pct(d.qb_location.eq("P").where(d.qb_location.notna())),
+            "empty_rate": _pct(d.n_offense_backfield.eq(0).where(d.n_offense_backfield.notna())),
+            "two_back_rate": _pct(d.n_offense_backfield.ge(2).where(d.n_offense_backfield.notna())),
+            "screen_rate": _pct(d[d.pass_attempt == 1].is_screen_pass),
+            "rpo_rate": _pct(d.is_rpo),
         }
     prof = pd.DataFrame.from_dict(rows, orient="index")
     _, part = personnel_season(data)
@@ -278,6 +308,26 @@ def formation_mix(data: dict, team: str, side: str) -> pd.DataFrame:
                              epa_per_play=("epa", "mean"), success_rate=("success", "mean"))
     out["share"] = out.plays / out.plays.sum()
     return out.sort_values("plays", ascending=False)
+
+
+def alignment_mix(data: dict, team: str, side: str) -> pd.DataFrame:
+    """Current-season FTN formation tendencies: QB alignment and backfield count, with results for each look.
+    For a defense, the same split of the looks it has faced and what it allowed."""
+    d = _join_ftn(_reg_plays(data["pbp"]), data["ftn"])
+    d = d[d["posteam" if side == "offense" else "defteam"] == team]
+    backs = d.n_offense_backfield.map(lambda n: np.nan if pd.isna(n) else
+                                      "Empty" if n == 0 else "1 back" if n == 1 else "2+ backs")
+    parts = []
+    for look, order in ((d.qb_location.map(QB_LOCATION), list(QB_LOCATION.values())),
+                        (backs, ["Empty", "1 back", "2+ backs"])):
+        g = d.assign(look=look).dropna(subset=["look"]).groupby("look").agg(
+            plays=("epa", "size"), pass_rate=("qb_dropback", "mean"), epa_per_play=("epa", "mean"),
+            success_rate=("success", "mean"))
+        g["share"] = g.plays / g.plays.sum()
+        parts.append(g.reindex([o for o in order if o in g.index]))
+    out = pd.concat(parts)
+    out.index.name = None
+    return out
 
 
 def receiver_coverage_splits(data: dict) -> pd.DataFrame:
@@ -354,6 +404,18 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
     df["tgt_share"] = [share(pid, team_tgts, r.targets) for pid, r in df.iterrows()]
     df["carry_share"] = [share(pid, team_car, r.carries) for pid, r in df.iterrows()]
     df.loc[df.position.isin(["K", "DST"]), ["tgt_share", "carry_share"]] = np.nan
+
+    # Target quality from this season's FTN charting.
+    tq, team_first = target_quality_by_game(data["pbp"], data["ftn"])
+    q_cols = ["ftn_tgts", "first_reads", "catchable", "contested", "drops"]
+    q = tq.groupby("player_id")[q_cols].sum() if len(tq) else pd.DataFrame(columns=q_cols)
+    df = df.join(q)
+    charted = df.ftn_tgts.where(df.ftn_tgts > 0)
+    df["first_read_share"] = [share(pid, team_first, r.first_reads) if r.ftn_tgts > 0 else np.nan
+                              for pid, r in df.iterrows()]
+    df["catchable_rate"] = df.catchable / charted
+    df["contested_rate"] = df.contested / charted
+    df.loc[~df.position.isin(["RB", "WR", "TE"]), ["first_read_share", "catchable_rate", "contested_rate", "drops"]] = np.nan
     df["adot"] = np.where(df.targets > 0, df.air / df.targets.replace(0, np.nan), np.nan)
     df["ppg"] = np.where(df.g > 0, df.pts / df.g.replace(0, np.nan), np.nan)
     has_prev = df.ppg_prev.notna()
@@ -390,7 +452,8 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
     df.loc[df.opp.isna(), "proj"] = 0.0  # bye week
     df = df.sort_values("proj", ascending=False)
     ctx = {"defense": defense, "offense": offense, "schedule": sched, "fp_cur": fp_cur, "fp_all": fp_all,
-           "coverage_splits": receiver_coverage_splits(data), "info": info}
+           "coverage_splits": receiver_coverage_splits(data), "info": info,
+           "ftn_through": int(fp_cur[fp_cur.game_id.isin(tq.game_id)].week.max()) if len(tq) else None}
     return df, ctx
 
 
@@ -433,6 +496,10 @@ def matchup_notes(r: pd.Series, ctx: dict) -> list[str]:
             better = "man" if sp.ypt_man > sp.ypt_zone else "zone"
             line += f"; {r['name']} averages {sp.ypt_man:.1f} yds/tgt vs man, {sp.ypt_zone:.1f} vs zone (better vs {better})"
         notes.append(line + ".")
+    if r.position in ("WR", "TE") and pd.notna(r.get("first_read_share")) and r.first_read_share > 0.25:
+        notes.append(f"Primary read: {r.first_read_share:.0%} of {r.team}'s first-read throws have gone to "
+                     f"{r['name']} this season ({r.catchable_rate:.0%} of targets catchable, "
+                     f"{int(r.drops)} drop{'s' * (int(r.drops) != 1)}) — volume by design, not leftovers.")
     if r.position in ("WR", "TE") and pd.notna(r.adot) and r.adot >= 12 and pd.notna(d.deep_ypa_allowed):
         notes.append(f"Deep threat (aDOT {r.adot:.1f}); {r.opp} allows {d.deep_ypa_allowed:.1f} yds per deep attempt "
                      f"(league {dfn.deep_ypa_allowed.mean():.1f}).")
