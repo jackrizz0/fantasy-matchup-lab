@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import time
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -207,6 +208,17 @@ def get_projections(season: int, ppr: float, week: int):
     return model.project(get_data(season), ppr, week)
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner="Finding usage shifts…")
+def get_usage_shifts(season: int, ppr: float, week: int):
+    return model.usage_shifts(get_projections(season, ppr, week)[1])
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Backtesting every completed week…")
+def get_backtest(season: int, ppr: float, through: int):
+    """`through` (latest week with stats) is only part of the cache key, so a new week triggers a fresh run."""
+    return model.backtest(get_data(season), ppr)
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner="Loading weather history (first run takes a minute or two)…")
 def get_weather_history(season: int):
     d = get_data(season)
@@ -323,6 +335,7 @@ proj["win_prob"] = proj.team.map(lambda t: team_wp.get(t, (None, None))[0]).asty
 proj["win_source"] = proj.team.map(lambda t: team_wp.get(t, (None, None))[1])
 defense, offense, sched = ctx["defense"], ctx["offense"], ctx["schedule"]
 pers_season = defense.attrs.get("personnel_season")
+ftn_through = ctx.get("ftn_through")
 label = lambda pid: f"{proj.at[pid, 'name']} ({proj.at[pid, 'position']}, {proj.at[pid, 'team']})"
 
 
@@ -340,7 +353,8 @@ ui.hero(f"{season} season · {scoring}", "MATCHUP LAB",
         str(week), "week",
         [f"🔴 {live_now} live now" if live_now else f"🏈 {len(sched) // 2} games this week",
          f"🌦️ {wx_games} weather games" if wx_games else "☀️ No weather concerns",
-         f"📊 Stats through Week {played_through}", f"🧩 Personnel data: {pers_season}"])
+         f"📊 Stats through Week {played_through}", f"🧩 Personnel data: {pers_season}"]
+        + ([f"📝 Charting: {season} thru Wk {ftn_through}"] if ftn_through else []))
 
 
 @st.fragment(run_every=30 if live_now else None)
@@ -355,6 +369,8 @@ live_scoreboard()
 DISPLAY = {"name": "Player", "position": "Pos", "team": "Team", "opp": "Opp", "proj": "Proj",
            "ppg": f"{season} PPG", "last3": "Last 3", "ppg_prev": f"{season - 1} PPG",
            "tgt_share": "Tgt %", "carry_share": "Carry %", "adot": "aDOT", "rz": "RZ opps",
+           "first_read_share": "1st-read %", "catchable_rate": "Catchable %", "contested_rate": "Contested %",
+           "drops": "Drops",
            "dvp_mult": "Matchup ×", "scheme_mult": "Scheme ×", "env_mult": "Vegas ×", "weather_mult": "Weather ×",
            "implied_total": "Implied pts", "win_prob": "Win %", "weather": "Weather"}
 PERSONNEL_COLS = {
@@ -365,6 +381,13 @@ PERSONNEL_COLS = {
     "epa_per_play": st.column_config.NumberColumn("EPA / play", format="%+.2f"),
 }
 MULTS = ["Matchup ×", "Scheme ×", "Vegas ×", "Weather ×"]
+TQ_HELP = {
+    "1st-read %": f"Share of the team's first-read throws that went to this player, in games they played "
+                  f"({season} FTN charting).",
+    "Catchable %": f"Share of this player's targets that were catchable balls ({season} FTN charting).",
+    "Contested %": f"Share of this player's targets thrown into tight coverage ({season} FTN charting).",
+    "Drops": f"Charted drops this season ({season} FTN charting).",
+}
 
 
 def photo(r) -> str:
@@ -375,11 +398,15 @@ def table(df: pd.DataFrame, height: int | str = "auto"):
     view = df.assign(photo=[photo(r) for _, r in df.iterrows()])
     out = view[["photo"] + [c for c in DISPLAY if c in view]].rename(columns=DISPLAY)
     mults = [m for m in MULTS if m in out]
-    styled = out.style.map(ui.mult_color, subset=mults).format({m: "{:.2f}" for m in mults}, na_rep="–")
+    rates = [c for c in ["1st-read %", "Catchable %", "Contested %"] if c in out]
+    styled = out.style.map(ui.mult_color, subset=mults).format(
+        {**{m: "{:.2f}" for m in mults}, **{c: "{:.0%}" for c in rates},
+         **({"Drops": "{:.0f}"} if "Drops" in out else {})}, na_rep="–")
     pct = {c: st.column_config.ProgressColumn(c, format="percent", min_value=0, max_value=1)
            for c in ["Tgt %", "Carry %", "Win %"]}
     nums = {c: st.column_config.NumberColumn(c, format="%.1f")
             for c in [f"{season} PPG", "Last 3", f"{season - 1} PPG", "aDOT", "Implied pts"]}
+    nums |= {c: st.column_config.NumberColumn(c, help=h) for c, h in TQ_HELP.items()}
     st.dataframe(styled, hide_index=True, width="stretch", height=height, column_config={
         "photo": st.column_config.ImageColumn("", width="small"),
         "Player": st.column_config.TextColumn("Player", width="medium"),
@@ -441,8 +468,9 @@ def metric_grid(items: list, ncols: int = 3):
             cols[i % ncols].metric(lab, fmt[kind](v), dfmt[kind](v - lg) if pd.notna(lg) else None, delta_color="off")
 
 
-tab_lineup, tab_rank, tab_game, tab_wx, tab_def = st.tabs(
-    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses"])
+tab_lineup, tab_rank, tab_shift, tab_game, tab_wx, tab_def, tab_score = st.tabs(
+    ["🧑‍🤝‍🧑 My Lineup", "📋 Rankings", "📈 Usage Shifts", "🔎 Game Breakdown", "🌦️ Weather", "🛡️ Defenses",
+     "🎯 Model Scorecard"])
 
 # ---------------------------------------------------------------- my lineup
 with tab_lineup:
@@ -496,7 +524,51 @@ with tab_rank:
     st.caption("**Proj** = blended points per game (this season, with last season as a prior) × **Matchup** "
                "(opponent points allowed to the position) × **Scheme** (opponent efficiency vs pass/run) × "
                "**Vegas** (implied team total) × **Weather** (how the position scores in the forecast conditions). "
-               "Green multipliers help, red ones hurt.")
+               "Green multipliers help, red ones hurt.  \n"
+               f"**1st-read %, Catchable %, Contested %, Drops** come from {season} FTN charting"
+               + (f" (through Week {ftn_through})" if ftn_through else "") + ": first-read share is how often the "
+               "QB's first read was this player, out of the team's first-read throws in games they played.")
+
+# ---------------------------------------------------------------- usage shifts
+with tab_shift:
+    shifts = get_usage_shifts(season, ppr, week)
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        spos = st.segmented_control("Position", ["All", "RB", "WR", "TE"], default="All", key="shift_pos") or "All"
+    with c2:
+        smetric = st.segmented_control("Share", ["All"] + list(model.SHIFT_METRICS), default="All",
+                                       key="shift_metric") or "All"
+    if shifts.empty:
+        st.info("No usage changes of 8+ points yet — this needs at least 3 games played.")
+    else:
+        v = shifts
+        if spos != "All":
+            v = v[v.position == spos]
+        if smetric != "All":
+            v = v[v.metric == smetric]
+        up, down = int((v.change > 0).sum()), int((v.change < 0).sum())
+        st.caption(f"**{len(v)} changes** · {up} up · {down} down · biggest first")
+        info_cols = ctx["info"].reindex(v.player_id)
+        out = pd.DataFrame({
+            "photo": [photo(r) for _, r in info_cols.assign(team=v.team.values).iterrows()],
+            "Player": v.name.values, "Pos": v.position.values, "Team": v.team.values, "Share": v.metric.values,
+            "Before": v.before.values, "Last 2": v["last"].values, "Change": v.change.values,
+            "Why": v.reason.values})
+        st.dataframe(out.style.map(ui.sign_color, subset=["Change"]).format(
+                         {"Before": "{:.0%}", "Last 2": "{:.0%}", "Change": lambda x: f"{x * 100:+.0f} pts"}),
+                     hide_index=True, width="stretch", height=min(40 + 35 * len(out), 760), column_config={
+                         "photo": st.column_config.ImageColumn("", width="small"),
+                         "Player": st.column_config.TextColumn("Player", width="medium"),
+                         "Why": st.column_config.TextColumn("Why", width="large")})
+    before_games = int(played_through) - 2 if played_through else 0
+    st.caption(
+        f"Share of team targets, carries and first-read throws over each team's **last 2 games** vs the rest of the "
+        f"{season} season since the player joined the team. A game without a target or carry counts as zero, so "
+        "injuries and benchings show up. Changes of 8+ points are listed; ones where the player never averaged 2+ "
+        f"of that stat per game are skipped. First-read share comes from {season} FTN charting. \"Why\" points to "
+        "the player's own missed games first, otherwise the teammate whose share moved most the other way."
+        + (f"  \n⚠️ Only {before_games} earlier game{'s' * (before_games != 1)} to compare against so far — expect "
+           "big swings until the sample grows." if 0 < before_games < 3 else ""))
 
 # ---------------------------------------------------------------- game breakdown
 with tab_game:
@@ -526,9 +598,18 @@ with tab_game:
         off, dfn = (home, away) if side and side.startswith(home) else (away, home)
         o = offense.loc[off] if off in offense.index else pd.Series(dtype=float)
         d = defense.loc[dfn]
+        cur_tag = f"{season}" + (f", Wk 1–{ftn_through}" if ftn_through else "")
+        legend = (f"**{season}** stats are this season's play-by-play and FTN charting"
+                  + (f" (through Week {ftn_through})" if ftn_through else "") + ".")
+        if pers_season != season:
+            legend += (f" Stats marked **{pers_season}** (personnel groupings, man/zone, pressure, coverage and "
+                       f"sub-packages) come from last season's NFL participation data — {season} participation "
+                       "hasn't been published yet.")
+        st.info(legend, icon="🗓️")
+        mix_order = ["plays", "share", "pass_rate", "success_rate", "epa_per_play"]
         c1, c2 = st.columns(2, gap="large")
         with c1:
-            ui.section(f"{off} offense")
+            ui.section(f"{off} offense · {season}")
             metric_grid([
                 ("Plays / game", o.get("plays_per_game"), offense.plays_per_game.mean(), "num"),
                 ("Neutral pass rate", o.get("neutral_pass_rate"), offense.neutral_pass_rate.mean(), "pct"),
@@ -537,27 +618,41 @@ with tab_game:
                 ("Motion", o.get("motion_rate"), offense.motion_rate.mean(), "pct"),
                 ("Play-action", o.get("play_action_rate"), offense.play_action_rate.mean(), "pct"),
             ])
-            st.caption(f"Personnel groupings ({pers_season})")
+            st.caption(f"**Formation tendencies · {cur_tag}** (FTN charting)")
+            metric_grid([
+                ("Under center", o.get("under_center_rate"), offense.under_center_rate.mean(), "pct"),
+                ("Empty backfield", o.get("empty_rate"), offense.empty_rate.mean(), "pct"),
+                ("2+ backs", o.get("two_back_rate"), offense.two_back_rate.mean(), "pct"),
+                ("Pistol", o.get("pistol_rate"), offense.pistol_rate.mean(), "pct"),
+                ("Screens (of passes)", o.get("screen_rate"), offense.screen_rate.mean(), "pct"),
+                ("RPO", o.get("rpo_rate"), offense.rpo_rate.mean(), "pct"),
+            ])
+            st.dataframe(model.alignment_mix(data, off, "offense"), width="stretch", column_config=PERSONNEL_COLS,
+                         column_order=mix_order)
+            st.caption(f"**Personnel groupings · {pers_season}** (NFL participation data)")
             mix = model.formation_mix(data, off, "offense").head(6)
-            st.dataframe(mix, width="stretch", column_config=PERSONNEL_COLS,
-                         column_order=["plays", "share", "pass_rate", "success_rate", "epa_per_play"])
+            st.dataframe(mix, width="stretch", column_config=PERSONNEL_COLS, column_order=mix_order)
         with c2:
             ui.section(f"{dfn} defense")
             metric_grid([
-                ("Blitz rate", d.get("blitz_rate"), defense.blitz_rate.mean(), "pct"),
-                ("Men in box", d.get("avg_box"), defense.avg_box.mean(), "num"),
+                (f"Blitz rate ({season})", d.get("blitz_rate"), defense.blitz_rate.mean(), "pct"),
+                (f"Men in box ({season})", d.get("avg_box"), defense.avg_box.mean(), "num"),
                 (f"Man coverage ({pers_season})", d.get("man_rate"), defense.get("man_rate", pd.Series(dtype=float)).mean(), "pct"),
                 (f"Pressure rate ({pers_season})", d.get("pressure_rate"),
                  defense.get("pressure_rate", pd.Series(dtype=float)).mean(), "pct"),
-                ("Deep yds / att allowed", d.get("deep_ypa_allowed"), defense.deep_ypa_allowed.mean(), "num"),
-                ("10+ yd runs allowed", d.get("explosive_run_rate"), defense.explosive_run_rate.mean(), "pct"),
+                (f"Deep yds / att allowed ({season})", d.get("deep_ypa_allowed"), defense.deep_ypa_allowed.mean(), "num"),
+                (f"10+ yd runs allowed ({season})", d.get("explosive_run_rate"), defense.explosive_run_rate.mean(), "pct"),
             ])
+            st.caption(f"**vs offensive formations · {cur_tag}** (FTN charting) — what {dfn} has allowed by look")
+            st.dataframe(model.alignment_mix(data, dfn, "defense"), width="stretch", column_config=PERSONNEL_COLS,
+                         column_order=mix_order)
             if "top_coverage" in defense and pd.notna(d.get("top_coverage")):
                 st.caption(f"Most-used coverage ({pers_season}): **{d.top_coverage}**")
-            st.caption(f"Sub-packages ({pers_season})")
+            st.caption(f"**Sub-packages · {pers_season}** (NFL participation data)")
             st.dataframe(model.formation_mix(data, dfn, "defense"), width="stretch", column_config=PERSONNEL_COLS,
-                         column_order=["plays", "share", "pass_rate", "success_rate", "epa_per_play"])
+                         column_order=mix_order)
         ui.section(f"What {dfn} allows (fantasy pts / game, rank 1 = most generous)")
+        st.caption(f"{season} games, blended with {season - 1} as a prior while the sample is small.")
         pcols = st.columns(5)
         for col, p in zip(pcols, ["QB", "RB", "WR", "TE", "K"]):
             col.metric(p, f"{d[f'{p}_pts_allowed']:.1f}", f"#{d[f'{p}_rank']} of {len(defense)}", delta_color="off")
@@ -624,6 +719,110 @@ with tab_def:
     st.caption(f"Blitz and box counts from {season} FTN charting. Man %, pressure, nickel/dime and coverage from "
                f"{pers_season} NFL participation data (the latest published). Green = more fantasy points allowed. "
                "The D/ST column is how many points opposing defenses score against this team's offense.")
+
+# ---------------------------------------------------------------- model scorecard
+with tab_score:
+    st.markdown("How well has Matchup Lab projected this season? Each completed week is re-projected using **only "
+                "plays from the weeks before it**, then compared with what actually happened — and with a simple "
+                "baseline: each player's season average going into the week.")
+    if not st.session_state.get("scorecard_on"):
+        st.button("Run the backtest", type="primary", on_click=lambda: st.session_state.update(scorecard_on=True))
+        st.caption("Takes a few seconds the first time; results are then cached.")
+    else:
+        bt, bt_log = get_backtest(season, ppr, played_through)
+        if bt.empty:
+            st.info("No completed weeks to score yet.")
+        else:
+            overall = model.scorecard(bt, None).iloc[0]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Weeks scored", f"{bt.week.nunique()}", f"Weeks {bt.week.min()}–{bt.week.max()}",
+                      delta_color="off")
+            m2.metric("Avg miss (MAE)", f"{overall.mae:.2f} pts",
+                      f"{overall.mae - overall.base_mae:+.2f} vs season avg ({overall.base_mae:.2f})",
+                      delta_color="inverse", help="Mean absolute error per player-game, fantasy-relevant players.")
+            m3.metric("Start/sit hit rate", f"{overall.start_hit:.0%}",
+                      f"{(overall.start_hit - overall.base_start_hit) * 100:+.0f} pts vs season avg "
+                      f"({overall.base_start_hit:.0%})", help="Of the players projected as starters (top 12 QB/TE/K/"
+                      "D/ST, top 24 RB, top 36 WR each week), the share who finished as one.")
+            m4.metric("Bias", f"{overall.bias:+.2f} pts", "projects high" if overall.bias > 0.5 else
+                      "projects low" if overall.bias < -0.5 else "about even", delta_color="off",
+                      help="Average of projection − actual. Positive means projections run high.")
+
+            score_cols = {
+                "players": st.column_config.NumberColumn("Player-games"),
+                "mae": st.column_config.NumberColumn("Model MAE"),
+                "base_mae": st.column_config.NumberColumn("Season-avg MAE"),
+                "gain": st.column_config.NumberColumn("Error cut", help="How much smaller the model's average miss "
+                                                      "is than the season-average baseline's."),
+                "bias": st.column_config.NumberColumn("Bias"),
+                "start_hit": st.column_config.NumberColumn("Start/sit (model)"),
+                "base_start_hit": st.column_config.NumberColumn("Start/sit (season avg)"),
+            }
+            order = list(score_cols)
+
+            def score_style(t: pd.DataFrame):
+                t = t.rename_axis(None)
+                return t.style.map(ui.sign_color, subset=["gain"]).format(
+                    {"players": "{:.0f}", "mae": "{:.2f}", "base_mae": "{:.2f}", "gain": "{:+.0%}", "bias": "{:+.2f}",
+                     "start_hit": "{:.0%}", "base_start_hit": "{:.0%}"}, na_rep="–")
+            c1, c2 = st.columns([3, 2], gap="large")
+            with c1:
+                ui.section("By position")
+                by_pos = model.scorecard(bt, "position").reindex(model.POSITIONS).rename(index={"DST": "D/ST"})
+                st.dataframe(score_style(by_pos), width="stretch",
+                             column_config=score_cols, column_order=order)
+            with c2:
+                ui.section("By week")
+                by_week = model.scorecard(bt, "week").rename(index=lambda w: f"Week {w}")
+                st.dataframe(score_style(by_week), width="stretch",
+                             column_config=score_cols, column_order=["mae", "base_mae", "gain", "start_hit"])
+
+            ui.section("Biggest misses")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                mpos = st.segmented_control("Position", ["All"] + model.POSITIONS, default="All", key="miss_pos",
+                                            format_func=lambda p: SLOT_LABELS.get(p, p)) or "All"
+            with c2:
+                mkind = st.segmented_control("Show", ["All misses", "Start/sit misses"], default="All misses",
+                                             key="miss_kind") or "All misses"
+            miss = bt[bt.relevant]
+            if mpos != "All":
+                miss = miss[miss.position == mpos]
+            call = np.select([miss.start & ~miss.should_start, ~miss.start & miss.should_start],
+                             ["Busted start", "Missed sleeper"], "")
+            miss = miss.assign(call=call)
+            if mkind == "Start/sit misses":
+                miss = miss[miss.call != ""]
+            miss = miss.reindex(miss.error.abs().sort_values(ascending=False).index).head(40)
+            st.dataframe(pd.DataFrame({
+                "Week": miss.week.values, "Player": miss.name.values, "Pos": miss.position.values,
+                "Team": miss.team.values, "Opp": miss.opp.values, "Proj": miss.proj.values,
+                "Season avg": miss.baseline.values, "Actual": miss.actual.values, "Miss": miss.error.values,
+                "Start/sit": miss.call.values}).style.map(lambda v: ui.sign_color(-v), subset=["Miss"]).format(
+                    {"Proj": "{:.1f}", "Season avg": "{:.1f}", "Actual": "{:.1f}", "Miss": "{:+.1f}"}),
+                hide_index=True, width="stretch", height=min(40 + 35 * len(miss), 720))
+            st.caption("**Miss** = projection − actual (negative: the player beat the projection). **Busted start** "
+                       "= projected as a starter but finished outside the top group; **Missed sleeper** = the reverse.")
+
+            with st.expander("How this is tested — and how we know it can't see the future"):
+                st.markdown(
+                    f"- For each completed week, current-season play-by-play, FTN charting and participation rows are "
+                    f"cut to **earlier weeks only** before `project()` runs. Last season's data and each game's "
+                    f"pregame Vegas lines are allowed — both were known before kickoff.\n"
+                    "- Each player's team is the one they played for that week (known at kickoff), not today's "
+                    "roster, and today's injury/roster status isn't used.\n"
+                    "- Weather adjustments aren't applied here (past forecasts aren't stored), so these are the "
+                    "projections before the weather multiplier.\n"
+                    "- Scored on players who played that week and whom either method ranked inside twice the starter "
+                    "count at their position — chosen with pregame info only, so neither method gets to pick.\n"
+                    "- `tests/test_backtest_leakage.py` scrambles every play from the target week onward and checks "
+                    "the projections don't change at all.")
+                log = bt_log.assign(latest_week=bt_log.latest_week.map(
+                    lambda w: "— (last season only)" if pd.isna(w) else f"Week {int(w)}"))
+                st.dataframe(log.rename(columns={"week": "Week projected", "plays": f"{season} plays used",
+                                                 "latest_week": "Latest week used", "ftn_rows": "FTN rows used",
+                                                 "ftn_ok": "FTN rows all from earlier games"}),
+                             hide_index=True, width="stretch")
 
 st.caption("Data: [nflverse](https://github.com/nflverse) (play-by-play, participation, rosters, schedules & Vegas "
            "lines) · Charting data: [FTN Data](https://ftndata.com), licensed "

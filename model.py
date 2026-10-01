@@ -16,7 +16,7 @@ EPA_PRIOR_PLAYS = 150  # same, for a defense's EPA allowed (in plays)
 
 # ---------------------------------------------------------------- helpers
 def _reg_plays(pbp: pd.DataFrame | None) -> pd.DataFrame:
-    if pbp is None or pbp.empty:
+    if pbp is None:
         return pd.DataFrame()
     p = pbp[(pbp.season_type == "REG") & pbp.play_type.isin(["pass", "run"])]
     return p[p.two_point_attempt != 1]
@@ -142,14 +142,40 @@ def dst_by_game(pbp: pd.DataFrame | None, games: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- team tendencies
+FTN_STATS = ["n_blitzers", "n_pass_rushers", "n_defense_box", "is_motion", "is_play_action", "read_thrown",
+             "is_catchable_ball", "is_contested_ball", "is_drop", "is_screen_pass", "is_rpo", "qb_location",
+             "n_offense_backfield"]
+QB_LOCATION = {"U": "Under center", "S": "Shotgun", "P": "Pistol"}
+
+
 def _join_ftn(pbp: pd.DataFrame, ftn: pd.DataFrame | None) -> pd.DataFrame:
     if ftn is None or ftn.empty:
-        return pbp.assign(n_blitzers=np.nan, n_pass_rushers=np.nan, n_defense_box=np.nan,
-                          is_motion=np.nan, is_play_action=np.nan)
-    cols = ["nflverse_game_id", "nflverse_play_id", "n_blitzers", "n_pass_rushers",
-            "n_defense_box", "is_motion", "is_play_action"]
-    f = ftn[cols].rename(columns={"nflverse_game_id": "game_id", "nflverse_play_id": "play_id"})
+        return pbp.assign(**{c: np.nan for c in FTN_STATS})
+    f = ftn[["nflverse_game_id", "nflverse_play_id"] + FTN_STATS] \
+        .rename(columns={"nflverse_game_id": "game_id", "nflverse_play_id": "play_id"})
+    f = f.assign(qb_location=f.qb_location.where(f.qb_location.isin(list(QB_LOCATION))))  # "0" = not charted
     return pbp.merge(f, on=["game_id", "play_id"], how="left")
+
+
+def target_quality_by_game(pbp: pd.DataFrame | None, ftn: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.Series]:
+    """FTN-charted targets per receiver per game (first reads, catchable, contested, drops), plus each team's
+    first-read throws per game — the denominator for first-read share. FTN sometimes publishes a game before
+    charting its reads (every play "0", no catchable/contested flags), so only team-games with at least one
+    first-read throw count; otherwise those games would drag down catchable and contested rates."""
+    p = _join_ftn(_reg_plays(pbp), ftn)
+    p = p[p.read_thrown.notna()] if not p.empty else p
+    if p.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+    team_first = p[p.read_thrown.eq("1") & (p.pass_attempt == 1)].groupby(["posteam", "game_id"]).size()
+    p = p[pd.MultiIndex.from_frame(p[["posteam", "game_id"]]).isin(team_first.index)]
+    first = p.read_thrown.eq("1")
+    t = p[p.receiver_player_id.notna()].assign(
+        first_read=first, catchable=p.is_catchable_ball.eq(True), contested=p.is_contested_ball.eq(True),
+        drop=p.is_drop.eq(True))
+    per = t.groupby(["receiver_player_id", "posteam", "game_id"]).agg(
+        ftn_tgts=("first_read", "size"), first_reads=("first_read", "sum"), catchable=("catchable", "sum"),
+        contested=("contested", "sum"), drops=("drop", "sum")).reset_index()
+    return per.rename(columns={"receiver_player_id": "player_id", "posteam": "team"}), team_first
 
 
 def _join_part(pbp: pd.DataFrame, part: pd.DataFrame | None) -> pd.DataFrame:
@@ -236,7 +262,7 @@ def defense_profile(data: dict, fp_all: pd.DataFrame, info: pd.DataFrame) -> pd.
             else:
                 vals[t] = (pts_c + prior * DEF_PRIOR_GAMES) / (g_c + DEF_PRIOR_GAMES)
         prof[f"{pos}_pts_allowed"] = pd.Series(vals)
-        prof[f"{pos}_rank"] = prof[f"{pos}_pts_allowed"].rank(ascending=False).astype("Int64")  # 1 = most generous
+        prof[f"{pos}_rank"] = prof[f"{pos}_pts_allowed"].rank(ascending=False, method="min").astype("Int64")  # 1 = most generous
     return prof
 
 
@@ -255,8 +281,17 @@ def offense_profile(data: dict) -> pd.DataFrame:
             "epa_per_play": d.epa.mean(),
             "sack_rate_allowed": _pct(d[d.qb_dropback == 1].sack),
             "giveaways_per_game": (d.interception.sum() + d.fumble_lost.sum()) / max(d.game_id.nunique(), 1),
+            # FTN formation charting (current season only).
+            "under_center_rate": _pct(d.qb_location.eq("U").where(d.qb_location.notna())),
+            "pistol_rate": _pct(d.qb_location.eq("P").where(d.qb_location.notna())),
+            "empty_rate": _pct(d.n_offense_backfield.eq(0).where(d.n_offense_backfield.notna())),
+            "two_back_rate": _pct(d.n_offense_backfield.ge(2).where(d.n_offense_backfield.notna())),
+            "screen_rate": _pct(d[d.pass_attempt == 1].is_screen_pass),
+            "rpo_rate": _pct(d.is_rpo),
         }
     prof = pd.DataFrame.from_dict(rows, orient="index")
+    if prof.empty:  # no current-season plays yet (e.g. backtesting Week 1)
+        prof = pd.DataFrame(columns=["epa_per_play", "sack_rate_allowed", "giveaways_per_game"], dtype=float)
     _, part = personnel_season(data)
     if not part.empty:
         mix = part.groupby("posteam").off_group.value_counts(normalize=True).unstack(fill_value=0)
@@ -278,6 +313,26 @@ def formation_mix(data: dict, team: str, side: str) -> pd.DataFrame:
                              epa_per_play=("epa", "mean"), success_rate=("success", "mean"))
     out["share"] = out.plays / out.plays.sum()
     return out.sort_values("plays", ascending=False)
+
+
+def alignment_mix(data: dict, team: str, side: str) -> pd.DataFrame:
+    """Current-season FTN formation tendencies: QB alignment and backfield count, with results for each look.
+    For a defense, the same split of the looks it has faced and what it allowed."""
+    d = _join_ftn(_reg_plays(data["pbp"]), data["ftn"])
+    d = d[d["posteam" if side == "offense" else "defteam"] == team]
+    backs = d.n_offense_backfield.map(lambda n: np.nan if pd.isna(n) else
+                                      "Empty" if n == 0 else "1 back" if n == 1 else "2+ backs")
+    parts = []
+    for look, order in ((d.qb_location.map(QB_LOCATION), list(QB_LOCATION.values())),
+                        (backs, ["Empty", "1 back", "2+ backs"])):
+        g = d.assign(look=look).dropna(subset=["look"]).groupby("look").agg(
+            plays=("epa", "size"), pass_rate=("qb_dropback", "mean"), epa_per_play=("epa", "mean"),
+            success_rate=("success", "mean"))
+        g["share"] = g.plays / g.plays.sum()
+        parts.append(g.reindex([o for o in order if o in g.index]))
+    out = pd.concat(parts)
+    out.index.name = None
+    return out
 
 
 def receiver_coverage_splits(data: dict) -> pd.DataFrame:
@@ -316,7 +371,9 @@ def default_week(games: pd.DataFrame, season: int) -> int:
     return int(upcoming.index.min()) if len(upcoming) else int(g.week.max())
 
 
-def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
+def project(data: dict, ppr: float, week: int, team_asof: pd.Series | None = None) -> tuple[pd.DataFrame, dict]:
+    """Projections for `week`. For backtests, `team_asof` (player_id -> team at kickoff) replaces the roster file's
+    team, and the roster's current status filter is skipped — both reflect today, not that week."""
     season = data["season"]
     games = data["games"]
     teams = sorted(set(games[games.season == season].home_team))
@@ -324,6 +381,9 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
                              "status": "ACT"}, index=pd.Index([f"DST_{t}" for t in teams], name="player_id"))
     info = pd.concat([player_info(data["roster"], data["roster_prev"]), dst_info])
     fp_cur = pd.concat([fantasy_by_game(data["pbp"], ppr), dst_by_game(data["pbp"], games)])
+    if fp_cur.empty:  # no current-season games yet (e.g. backtesting Week 1)
+        fp_cur = pd.DataFrame(columns=["season", "game_id", "week", "team", "opp", "player_id", "pts", "carries",
+                                       "targets", "receptions", "air_yards", "rz_opps"])
     fp_prev = pd.concat([fantasy_by_game(data["pbp_prev"], ppr), dst_by_game(data["pbp_prev"], games)])
     fp_all = pd.concat([fp_cur, fp_prev])
     defense = defense_profile(data, fp_all, info)
@@ -343,7 +403,8 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
 
     df = info.join(cur, how="left").join(prev, how="left").join(last3.rename("last3"))
     df = df[(df.g.fillna(0) > 0) | (df.g_prev.fillna(0) >= 4)]
-    df = df[df.status.fillna("ACT").isin(["ACT", "RES"]) | (df.g.fillna(0) > 0)]
+    if team_asof is None:
+        df = df[df.status.fillna("ACT").isin(["ACT", "RES"]) | (df.g.fillna(0) > 0)]
     df[["g", "pts", "targets", "carries", "air", "rz", "g_prev"]] = df[["g", "pts", "targets", "carries", "air", "rz", "g_prev"]].fillna(0)
 
     def share(pid, series, own):
@@ -354,6 +415,18 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
     df["tgt_share"] = [share(pid, team_tgts, r.targets) for pid, r in df.iterrows()]
     df["carry_share"] = [share(pid, team_car, r.carries) for pid, r in df.iterrows()]
     df.loc[df.position.isin(["K", "DST"]), ["tgt_share", "carry_share"]] = np.nan
+
+    # Target quality from this season's FTN charting.
+    tq, team_first = target_quality_by_game(data["pbp"], data["ftn"])
+    q_cols = ["ftn_tgts", "first_reads", "catchable", "contested", "drops"]
+    q = tq.groupby("player_id")[q_cols].sum() if len(tq) else pd.DataFrame(columns=q_cols)
+    df = df.join(q)
+    charted = df.ftn_tgts.where(df.ftn_tgts > 0)
+    df["first_read_share"] = [share(pid, team_first, r.first_reads) if r.ftn_tgts > 0 else np.nan
+                              for pid, r in df.iterrows()]
+    df["catchable_rate"] = df.catchable / charted
+    df["contested_rate"] = df.contested / charted
+    df.loc[~df.position.isin(["RB", "WR", "TE"]), ["first_read_share", "catchable_rate", "contested_rate", "drops"]] = np.nan
     df["adot"] = np.where(df.targets > 0, df.air / df.targets.replace(0, np.nan), np.nan)
     df["ppg"] = np.where(df.g > 0, df.pts / df.g.replace(0, np.nan), np.nan)
     has_prev = df.ppg_prev.notna()
@@ -361,6 +434,8 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
     df["base"] = np.where(has_prev, (df.pts + df.ppg_prev.fillna(0) * prior_g) / (df.g + prior_g), df.ppg)
 
     team = df.team.fillna(df.last_team)
+    if team_asof is not None:
+        team = team_asof.reindex(df.index).fillna(df.last_team).fillna(team)
     df["team"] = team
     df["opp"] = team.map(sched.opp) if len(sched) else np.nan
     df["implied_total"] = team.map(sched.implied_total) if len(sched) else np.nan
@@ -390,7 +465,9 @@ def project(data: dict, ppr: float, week: int) -> tuple[pd.DataFrame, dict]:
     df.loc[df.opp.isna(), "proj"] = 0.0  # bye week
     df = df.sort_values("proj", ascending=False)
     ctx = {"defense": defense, "offense": offense, "schedule": sched, "fp_cur": fp_cur, "fp_all": fp_all,
-           "coverage_splits": receiver_coverage_splits(data), "info": info}
+           "coverage_splits": receiver_coverage_splits(data), "info": info,
+           "ftn_through": int(fp_cur[fp_cur.game_id.isin(tq.game_id)].week.max()) if len(tq) else None,
+           "target_quality": (tq, team_first)}
     return df, ctx
 
 
@@ -433,6 +510,10 @@ def matchup_notes(r: pd.Series, ctx: dict) -> list[str]:
             better = "man" if sp.ypt_man > sp.ypt_zone else "zone"
             line += f"; {r['name']} averages {sp.ypt_man:.1f} yds/tgt vs man, {sp.ypt_zone:.1f} vs zone (better vs {better})"
         notes.append(line + ".")
+    if r.position in ("WR", "TE") and pd.notna(r.get("first_read_share")) and r.first_read_share > 0.25:
+        notes.append(f"Primary read: {r.first_read_share:.0%} of {r.team}'s first-read throws have gone to "
+                     f"{r['name']} this season ({r.catchable_rate:.0%} of targets catchable, "
+                     f"{int(r.drops)} drop{'s' * (int(r.drops) != 1)}) — volume by design, not leftovers.")
     if r.position in ("WR", "TE") and pd.notna(r.adot) and r.adot >= 12 and pd.notna(d.deep_ypa_allowed):
         notes.append(f"Deep threat (aDOT {r.adot:.1f}); {r.opp} allows {d.deep_ypa_allowed:.1f} yds per deep attempt "
                      f"(league {dfn.deep_ypa_allowed.mean():.1f}).")
@@ -445,6 +526,198 @@ def matchup_notes(r: pd.Series, ctx: dict) -> list[str]:
     if pd.notna(d.get("Nickel (5 DB)")) and r.position in ("WR", "TE"):
         notes.append(f"{r.opp} is in nickel {d['Nickel (5 DB)']:.0%} / dime {d['Dime+ (6+ DB)']:.0%} of snaps.")
     return notes
+
+
+# ---------------------------------------------------------------- usage shifts
+SHIFT_METRICS = {"Target share": ("targets", "targets", ["RB", "WR", "TE"]),
+                 "Carry share": ("carries", "carries", ["QB", "RB", "WR", "TE"]),
+                 "First-read share": ("first_reads", "first reads", ["RB", "WR", "TE"])}
+
+
+def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_game: float = 2.0) -> pd.DataFrame:
+    """RB/WR/TE whose target, carry or first-read share over their team's last `window` games moved at least
+    `threshold` from the rest of the season (games since the player joined the team; a game without a stat counts
+    as zero, so absences show). A change is skipped when the player never averaged `min_per_game` of that stat
+    per game in either stretch."""
+    fp, info = ctx["fp_cur"], ctx["info"]
+    tq, team_first = ctx["target_quality"]
+    if fp.empty:
+        return pd.DataFrame()
+    g = fp[~fp.player_id.str.startswith("DST_")][["player_id", "team", "game_id", "week", "targets", "carries"]]
+    g = g.merge(tq[["player_id", "team", "game_id", "first_reads"]] if len(tq) else
+                pd.DataFrame(columns=["player_id", "team", "game_id", "first_reads"]),
+                on=["player_id", "team", "game_id"], how="left")
+    g["first_reads"] = g.first_reads.fillna(0)
+    team = g.groupby(["team", "game_id", "week"], as_index=False)[["targets", "carries"]].sum()
+    team["first_reads"] = [team_first.get((t, gid), np.nan) for t, gid in zip(team.team, team.game_id)]
+    team["recent"] = team.groupby("team").week.rank(ascending=False) <= window
+    # Every team game since the player's first game for that team. Games without a stat count as zeros, so a
+    # player's own absences (injury, inactive, benched) show up as a falling share instead of being skipped.
+    first = g.groupby(["player_id", "team"], as_index=False).week.min().rename(columns={"week": "first_week"})
+    g = first.merge(team.rename(columns={"targets": "t_targets", "carries": "t_carries",
+                                         "first_reads": "t_first_reads"}), on="team") \
+        .query("week >= first_week") \
+        .merge(g[["player_id", "team", "game_id", "targets", "carries", "first_reads"]],
+               on=["player_id", "team", "game_id"], how="left")
+    g["played"] = g.targets.notna().astype(int)
+    g[["targets", "carries", "first_reads"]] = g[["targets", "carries", "first_reads"]].fillna(0)
+    stats = ["targets", "carries", "first_reads", "t_targets", "t_carries", "t_first_reads"]
+    keys = ["player_id", "team", "recent"]
+    agg = g.groupby(keys)[stats].sum(min_count=1)
+    agg["games"] = g.groupby(keys).played.sum()  # games with a stat
+    agg["team_games"] = g.groupby(keys).size()
+    before = agg.xs(False, level="recent")
+    after = agg.xs(True, level="recent")
+    both = after.join(before, lsuffix="_a", rsuffix="_b", how="outer")
+    both = both.join(info[["name", "position", "status"]], on="player_id")
+
+    def share(row, col, suffix):
+        tot = row[f"t_{col}_{suffix}"]
+        return row[f"{col}_{suffix}"] / tot if pd.notna(tot) and tot > 0 else np.nan
+
+    for label, (col, _, _) in SHIFT_METRICS.items():
+        both[f"{col}_share_a"] = [share(r, col, "a") for _, r in both.iterrows()]
+        both[f"{col}_share_b"] = [share(r, col, "b") for _, r in both.iterrows()]
+
+    def reason(pid, tm, r, col, unit, group, change):
+        missed_a, missed_b = int(r.team_games_a - r.games_a), int(r.team_games_b - r.games_b)
+        if change < 0 and missed_a:
+            ir = " (now on IR)" if r.status == "RES" else ""
+            return (f"No stat in {missed_a} of {tm}'s last {window} games{ir} — check injury/inactive status "
+                    f"before starting.")
+        if change > 0 and missed_b:
+            return (f"Back in the lineup: no stat in {missed_b} earlier game{'s' if missed_b > 1 else ''}, "
+                    f"{r[f'{col}_a'] / r.team_games_a:.1f} {unit}/gm over the last {window}.")
+        mates = both.xs(tm, level="team").drop(index=pid, errors="ignore")
+        mates = mates[mates.position.isin(group)]
+        # The teammate whose share moved most the other way explains it best. No stat in a window counts as 0%.
+        sa, sb = mates[f"{col}_share_a"], mates[f"{col}_share_b"]
+        swing = sa.where(mates.games_a.notna(), 0) - sb.where(mates.games_b.notna(), 0)
+        swing = swing[np.sign(swing) == -np.sign(change)].dropna()
+        if len(swing) and swing.abs().max() < abs(change) / 2 and (swing.abs() >= 0.05).sum() >= 2:
+            fmt = lambda s: f"{s:.0%}" if pd.notna(s) else "0%"
+            top = [mates.loc[i] for i in swing.abs().nlargest(2).index]
+            return f"{'Spread out' if change < 0 else 'Pulled from several players'} — " + ", ".join(
+                f"{m['name']} ({m.position}) {fmt(m[f'{col}_share_b'])} → {fmt(m[f'{col}_share_a'])}" for m in top) \
+                + f" of {unit}."
+        if len(swing) and swing.abs().max() >= 0.05:
+            m = mates.loc[swing.abs().idxmax()]
+            who = f"{m['name']} ({m.position})"
+            if not m.games_a > 0:
+                ir = ", now on IR," if m.status == "RES" else ""
+                return (f"{who}{ir} hasn't recorded a stat in the last {window} games after getting "
+                        f"{m[f'{col}_share_b']:.0%} of {tm}'s {unit} before.")
+            if not m.games_b > 0:
+                return f"{who} joined the mix, taking {m[f'{col}_share_a']:.0%} of {unit} over the last {window}."
+            way = "away from" if change > 0 else "to"
+            return (f"Work shifting {way} {who}: {m[f'{col}_share_b']:.0%} → "
+                    f"{m[f'{col}_share_a']:.0%} of {unit}.")
+        own_a, own_b = r[f"{col}_a"] / r.team_games_a, r[f"{col}_b"] / r.team_games_b
+        tot_a, tot_b = r[f"t_{col}_a"] / r.team_games_a, r[f"t_{col}_b"] / r.team_games_b
+        return (f"{own_a:.1f} {unit}/gm over the last {window} vs {own_b:.1f} before, on {tot_a:.0f} vs "
+                f"{tot_b:.0f} team {unit}/gm — {'a bigger' if change > 0 else 'a smaller'} slice, not just "
+                f"{'more' if change > 0 else 'less'} team volume." if abs(tot_a - tot_b) / max(tot_b, 1) < 0.15 else
+                f"{own_a:.1f} {unit}/gm over the last {window} vs {own_b:.1f} before; team {unit}/gm went "
+                f"{tot_b:.0f} → {tot_a:.0f}.")
+
+    rows = []
+    for (pid, tm), r in both[both.position.isin(["RB", "WR", "TE"])].iterrows():
+        if pd.isna(r.team_games_a) or pd.isna(r.team_games_b):
+            continue  # joined the team within the window: nothing to compare with
+        for label, (col, unit, group) in SHIFT_METRICS.items():
+            a, b = r[f"{col}_share_a"], r[f"{col}_share_b"]
+            if pd.isna(a) or pd.isna(b) or abs(a - b) < threshold:
+                continue
+            if max(r[f"{col}_a"] / r.team_games_a, r[f"{col}_b"] / r.team_games_b) < min_per_game:
+                continue  # e.g. 0 -> 1 target: a big share swing on almost no volume
+            rows.append({"player_id": pid, "name": r["name"], "position": r.position, "team": tm, "metric": label,
+                         "last": a, "before": b, "change": a - b, "games_last": int(r.games_a),
+                         "games_before": int(r.games_b), "reason": reason(pid, tm, r, col, unit, group, a - b)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.reindex(out.change.abs().sort_values(ascending=False).index).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- backtest
+START_SLOTS = {"QB": 12, "RB": 24, "WR": 36, "TE": 12, "K": 12, "DST": 12}  # starters in a 12-team league
+
+
+def data_through(data: dict, week: int) -> dict:
+    """The data as it stood before `week` kicked off: current-season plays (and their FTN charting / participation
+    rows) from earlier weeks only. Prior-season data, rosters and the schedule's pregame Vegas lines are kept."""
+    d = dict(data)
+    pbp = data["pbp"]
+    d["pbp"] = pbp[pbp.week < week]
+    ids = set(d["pbp"].game_id)
+    for key in ("ftn", "part"):
+        if data.get(key) is not None:
+            d[key] = data[key][data[key].nflverse_game_id.isin(ids)]
+    return d
+
+
+def completed_weeks(data: dict) -> list[int]:
+    g = data["games"]
+    g = g[(g.season == data["season"]) & (g.game_type == "REG")]
+    done = g.groupby("week").home_score.apply(lambda s: s.notna().all())
+    played = set(data["pbp"].week.unique())
+    return [int(w) for w, ok in done.items() if ok and w in played]
+
+
+def backtest(data: dict, ppr: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Re-run project() for every completed week using only what was known before it, and compare with what
+    happened. Returns one row per player-week, plus a per-week log of the data each run was allowed to see."""
+    pbp, games = data["pbp"], data["games"]
+    actual = pd.concat([fantasy_by_game(pbp, ppr), dst_by_game(pbp, games)])
+    rows, log = [], []
+    for w in completed_weeks(data):
+        d = data_through(data, w)
+        latest = int(d["pbp"].week.max()) if len(d["pbp"]) else None
+        if latest is not None and latest >= w:
+            raise AssertionError(f"Week {w} backtest can see Week {latest} plays")
+        ftn_ok = d["ftn"] is None or d["ftn"].nflverse_game_id.isin(set(d["pbp"].game_id)).all()
+        log.append({"week": w, "plays": len(d["pbp"]), "latest_week": latest,
+                    "ftn_rows": 0 if d["ftn"] is None else len(d["ftn"]), "ftn_ok": bool(ftn_ok)})
+        act = actual[actual.week == w].groupby("player_id").agg(actual=("pts", "sum"), team=("team", "first"))
+        proj, _ = project(d, ppr, w, team_asof=act.team)
+        # Baseline: this season's average before the week, or last season's if they hadn't played yet.
+        base = proj.ppg.where(proj.g > 0, proj.ppg_prev)
+        m = proj[["name", "position", "team", "opp", "proj"]].assign(baseline=base).join(act.actual, how="inner")
+        rows.append(m.assign(week=w).reset_index())
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame(log)
+    out = pd.concat(rows, ignore_index=True)
+    out = out[out.position.isin(POSITIONS) & out.baseline.notna()]
+    out["error"] = out.proj - out.actual
+    out["base_error"] = out.baseline - out.actual
+    grp = out.groupby(["week", "position"])
+    n = out.position.map(START_SLOTS)
+    out["start"] = grp.proj.rank(ascending=False, method="first") <= n
+    out["base_start"] = grp.baseline.rank(ascending=False, method="first") <= n
+    out["should_start"] = grp.actual.rank(ascending=False, method="first") <= n
+    # Score accuracy on fantasy-relevant players, picked with pregame info only: anyone either method ranked
+    # inside twice the starter count at their position.
+    out["relevant"] = (grp.proj.rank(ascending=False, method="first") <= 2 * n) | \
+                      (grp.baseline.rank(ascending=False, method="first") <= 2 * n)
+    return out, pd.DataFrame(log)
+
+
+def scorecard(bt: pd.DataFrame, by: str | None) -> pd.DataFrame:
+    """Accuracy summary, overall (by=None) or per `by` ("position" or "week"). MAE and bias use fantasy-relevant
+    players; start/sit hit rate = share of each method's projected starters who finished as a top-N starter."""
+    rel = bt[bt.relevant]
+    keys = [by] if by else (lambda _: 0)
+
+    def hit(g, col):
+        return (g[col] & g.should_start).sum() / g[col].sum() if g[col].sum() else np.nan
+
+    acc = rel.groupby(keys).agg(players=("error", "size"), mae=("error", lambda e: e.abs().mean()),
+                                base_mae=("base_error", lambda e: e.abs().mean()), bias=("error", "mean"))
+    ss = bt.groupby(keys)[["start", "base_start", "should_start"]].apply(
+        lambda g: pd.Series({"start_hit": hit(g, "start"), "base_start_hit": hit(g, "base_start")}))
+    out = acc.join(ss)
+    out["gain"] = 1 - out.mae / out.base_mae
+    return out
 
 
 def optimize_lineup(players: pd.DataFrame, slots: dict) -> pd.DataFrame:
