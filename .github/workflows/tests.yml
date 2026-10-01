@@ -1,0 +1,28 @@
+# Runs before anything reaches main (pushes to main redeploy the live app on Streamlit Community Cloud).
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # same as the Streamlit Cloud deploy
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: App loads without errors
+        run: python tests/test_app_smoke.py
+      - name: Backtest can't see future data
+        run: python tests/test_backtest_leakage.py
