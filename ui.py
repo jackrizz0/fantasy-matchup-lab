@@ -273,9 +273,9 @@ def player_card(r: pd.Series, slot: str | None, teams: Teams, fc_row, defense: p
     if not bye and r.opp in defense.index:
         rank = defense.at[r.opp, f"{r.position}_rank"]
         label = "vs offense" if r.position == "DST" else f"vs {r.position}"
-        chips.append(_chip(f"#{rank} matchup {label}", _tone(r.dvp_mult)))
+        chips.append(_chip(f"#{rank} matchup {label}", _tone(r.dvp_raw)))
     if pd.notna(r.get("implied_total")):
-        chips.append(_chip(f"Team total {r.implied_total:.1f}", _tone(r.env_mult)))
+        chips.append(_chip(f"Team total {r.implied_total:.1f}", _tone(r.env_raw)))
     if fc_row is not None and fc_row.tags:
         for tag in fc_row.tags:
             tone = "" if tag == weather.INDOORS else _tone(r.weather_mult, 1.01, 0.99)
@@ -354,7 +354,8 @@ def weather_card(f: pd.Series, teams: Teams) -> str:
 def mult_color(v):
     if pd.isna(v):
         return ""
-    return f"color: {GOOD}" if v >= 1.03 else f"color: {BAD}" if v <= 0.97 else f"color: {MUTED}"
+    # The applied (dampened) multipliers are small; ±1% is a real nudge to the projection.
+    return f"color: {GOOD}" if v >= 1.01 else f"color: {BAD}" if v <= 0.99 else f"color: {MUTED}"
 
 
 def sign_color(v):
