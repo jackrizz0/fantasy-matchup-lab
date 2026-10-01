@@ -21,6 +21,15 @@ python3 -m venv .venv
 
 Then open http://localhost:8501. The first launch downloads the NFL data (about a minute).
 
+## Tests
+
+```bash
+.venv/bin/python tests/test_app_smoke.py         # the whole app loads without errors
+.venv/bin/python tests/test_backtest_leakage.py  # the Model Scorecard can't see future data
+```
+
+GitHub Actions runs both on every pull request and push to `main` (`.github/workflows/tests.yml`).
+
 ## Data sources
 
 - [nflverse](https://github.com/nflverse) — play-by-play, rosters, schedules, Vegas lines, participation data
