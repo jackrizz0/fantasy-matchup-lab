@@ -135,11 +135,22 @@ def yahoo_section(season: int, maps: dict):
                        lambda: importers.yahoo_teams(tok["access_token"], league["league_key"], maps))
 
 
+def yahoo_enabled() -> bool:
+    """Yahoo import is offered only once the site's Yahoo app keys are in secrets. Without them, visitors would be
+    asked to register their own Yahoo developer app, which is too much to ask."""
+    cfg = yahoo_config()
+    return bool(cfg.get("client_id") and cfg.get("client_secret"))
+
+
 def import_panel(season: int, data: dict):
-    yahoo_handle_redirect()
-    with st.expander("📥 Import your team from Sleeper, ESPN or Yahoo",
+    platforms = ["Sleeper", "ESPN"] + (["Yahoo"] if yahoo_enabled() else [])
+    if "Yahoo" in platforms:
+        yahoo_handle_redirect()
+    elif st.session_state.get("import_platform") == "Yahoo":
+        del st.session_state["import_platform"]
+    with st.expander(f"📥 Import your team from {', '.join(platforms[:-1])} or {platforms[-1]}",
                      expanded=not st.query_params.get_all("p") or "yahoo_token" in st.session_state):
-        platform = st.radio("Platform", ["Sleeper", "ESPN", "Yahoo"], horizontal=True, key="import_platform")
+        platform = st.radio("Platform", platforms, horizontal=True, key="import_platform")
         maps = get_id_maps(season)
         teams = None
         try:

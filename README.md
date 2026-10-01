@@ -44,6 +44,8 @@ GitHub Actions runs both on every pull request and push to `main` (`.github/work
 3. Optional — Yahoo import: register an app at [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create)
    (Fantasy Sports: Read) with the site's URL as its Redirect URI, then paste the `[yahoo]` block from
    `.streamlit/secrets.example.toml` into the app's **Secrets** settings with your values.
+   Until `client_id` and `client_secret` are set, Yahoo is hidden from the import panel (locally too: put them in
+   `.streamlit/secrets.toml`).
 
 Each visitor's Yahoo sign-in and ESPN private-league cookies are kept only in their own browser session
 (in server memory for that session, never written to disk or shared with other visitors).
