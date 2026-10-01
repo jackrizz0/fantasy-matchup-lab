@@ -2,21 +2,56 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import importlib
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
+import data as nfl_data
 import importers
 import model
 import ui
 import weather
 import winprob
-from data import load_all
 
 st.set_page_config(page_title="Fantasy Matchup Lab", page_icon="🏈", layout="wide")
+
+# The app's own modules, in reload order (each after the modules it imports).
+LOCAL_MODULES = [nfl_data, weather, winprob, model, importers, ui]
+
+
+def _code_version() -> str:
+    h = hashlib.sha256()
+    for m in LOCAL_MODULES:
+        h.update(Path(m.__file__).read_bytes())
+    return h.hexdigest()
+
+
+@st.cache_resource
+def _loaded_code() -> dict:
+    return {"version": _code_version()}
+
+
+def reload_if_code_changed():
+    """Streamlit Community Cloud pulls pushed code without watching files: app.py re-runs with the new code, but
+    the imported modules (model, data, ...) and the cached results stay as they were at startup until a reboot.
+    So when any module's source changes, reload the modules and drop every cache (the NFL data re-downloads)."""
+    version = _code_version()
+    if _loaded_code()["version"] == version:
+        return
+    for m in LOCAL_MODULES:
+        importlib.reload(m)
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    _loaded_code()["version"] = version
+
+
+reload_if_code_changed()
 
 SCORING = {"PPR": 1.0, "Half PPR": 0.5, "Standard": 0.0}
 DEFAULT_SLOTS = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "SUPERFLEX": 0, "K": 1, "DST": 1}
@@ -195,7 +230,7 @@ def import_panel(season: int, data: dict):
 # of the play-by-play tables, multiplying memory use. Nothing downstream modifies these frames in place.
 @st.cache_resource(ttl=6 * 3600, show_spinner="Downloading NFL data from nflverse…")
 def get_data(season: int, force: bool = False):
-    return load_all(season, force)
+    return nfl_data.load_all(season, force)
 
 
 @st.cache_data(ttl=6 * 3600)
