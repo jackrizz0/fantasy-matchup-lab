@@ -495,7 +495,7 @@ with tab_lineup:
         bench = proj.loc[[p for p in roster if p not in lineup.index]].sort_values("proj", ascending=False)
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Projected points", f"{lineup.proj.sum():.1f}")
-        m2.metric("Strong matchups", int((lineup.dvp_mult >= 1.04).sum()), help="Starters facing a defense that "
+        m2.metric("Strong matchups", int((lineup.dvp_raw >= 1.04).sum()), help="Starters facing a defense that "
                   "allows more fantasy points than average to their position.")
         m3.metric("Weather-affected starters", int((lineup.weather_mult.sub(1).abs() > 0.005).sum()))
         byes = int(lineup.opp.isna().sum())

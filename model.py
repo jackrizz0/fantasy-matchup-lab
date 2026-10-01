@@ -12,6 +12,13 @@ PRIOR_GAMES = 3        # how many games' worth of weight last season's average g
 DST_PRIOR_GAMES = 6    # D/ST scoring is much noisier week to week, so lean on last season more
 DEF_PRIOR_GAMES = 4    # same, for a defense's points allowed
 EPA_PRIOR_PLAYS = 150  # same, for a defense's EPA allowed (in plays)
+# How strongly each matchup multiplier counts (1 = full strength, 0 = ignored): proj = base × mult ** weight.
+# Tuned on a full-2025 backtest and checked on 2026 Weeks 1–3, which the tuning never saw. At full strength the
+# multipliers ranked players about as well but overshot the point totals — mostly points-allowed-by-position, which
+# is noisy week to week: average miss 5.49 → 5.34 pts (2025) and 5.68 → 5.51 (2026), start/sit accuracy ~unchanged.
+DVP_WEIGHT = 0.25
+SCHEME_WEIGHT = 0.5
+VEGAS_WEIGHT = 0.5
 
 
 # ---------------------------------------------------------------- helpers
@@ -461,6 +468,10 @@ def project(data: dict, ppr: float, week: int, team_asof: pd.Series | None = Non
         return pd.Series({"dvp_mult": dvp, "scheme_mult": scheme, "env_mult": env})
 
     df = df.join(df.apply(mults, axis=1))
+    # Full-strength values still describe how good a matchup is (for labels like "strong matchup").
+    df["dvp_raw"], df["env_raw"] = df.dvp_mult, df.env_mult
+    for col, weight in (("dvp_mult", DVP_WEIGHT), ("scheme_mult", SCHEME_WEIGHT), ("env_mult", VEGAS_WEIGHT)):
+        df[col] = df[col] ** weight  # dampened, so the multipliers shown in the app are the ones applied
     df["proj"] = df.base * df.dvp_mult * df.scheme_mult * df.env_mult
     df.loc[df.opp.isna(), "proj"] = 0.0  # bye week
     df = df.sort_values("proj", ascending=False)
