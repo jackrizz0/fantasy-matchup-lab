@@ -159,11 +159,15 @@ def _join_ftn(pbp: pd.DataFrame, ftn: pd.DataFrame | None) -> pd.DataFrame:
 
 def target_quality_by_game(pbp: pd.DataFrame | None, ftn: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.Series]:
     """FTN-charted targets per receiver per game (first reads, catchable, contested, drops), plus each team's
-    first-read throws per game — the denominator for first-read share."""
+    first-read throws per game — the denominator for first-read share. FTN sometimes publishes a game before
+    charting its reads (every play "0", no catchable/contested flags), so only team-games with at least one
+    first-read throw count; otherwise those games would drag down catchable and contested rates."""
     p = _join_ftn(_reg_plays(pbp), ftn)
     p = p[p.read_thrown.notna()] if not p.empty else p
     if p.empty:
         return pd.DataFrame(), pd.Series(dtype=float)
+    team_first = p[p.read_thrown.eq("1") & (p.pass_attempt == 1)].groupby(["posteam", "game_id"]).size()
+    p = p[pd.MultiIndex.from_frame(p[["posteam", "game_id"]]).isin(team_first.index)]
     first = p.read_thrown.eq("1")
     t = p[p.receiver_player_id.notna()].assign(
         first_read=first, catchable=p.is_catchable_ball.eq(True), contested=p.is_contested_ball.eq(True),
@@ -171,7 +175,6 @@ def target_quality_by_game(pbp: pd.DataFrame | None, ftn: pd.DataFrame | None) -
     per = t.groupby(["receiver_player_id", "posteam", "game_id"]).agg(
         ftn_tgts=("first_read", "size"), first_reads=("first_read", "sum"), catchable=("catchable", "sum"),
         contested=("contested", "sum"), drops=("drop", "sum")).reset_index()
-    team_first = p[first & (p.pass_attempt == 1)].groupby(["posteam", "game_id"]).size()
     return per.rename(columns={"receiver_player_id": "player_id", "posteam": "team"}), team_first
 
 
@@ -533,8 +536,9 @@ SHIFT_METRICS = {"Target share": ("targets", "targets", ["RB", "WR", "TE"]),
 
 def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_game: float = 2.0) -> pd.DataFrame:
     """RB/WR/TE whose target, carry or first-read share over their team's last `window` games moved at least
-    `threshold` from the rest of the season. Shares only count games the player recorded a stat in, and a change
-    is skipped when the player never averaged `min_per_game` of that stat in either stretch."""
+    `threshold` from the rest of the season (games since the player joined the team; a game without a stat counts
+    as zero, so absences show). A change is skipped when the player never averaged `min_per_game` of that stat
+    per game in either stretch."""
     fp, info = ctx["fp_cur"], ctx["info"]
     tq, team_first = ctx["target_quality"]
     if fp.empty:
@@ -547,11 +551,21 @@ def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_ga
     team = g.groupby(["team", "game_id", "week"], as_index=False)[["targets", "carries"]].sum()
     team["first_reads"] = [team_first.get((t, gid), np.nan) for t, gid in zip(team.team, team.game_id)]
     team["recent"] = team.groupby("team").week.rank(ascending=False) <= window
-    g = g.merge(team.rename(columns={"targets": "t_targets", "carries": "t_carries", "first_reads": "t_first_reads"}),
-                on=["team", "game_id", "week"])
+    # Every team game since the player's first game for that team. Games without a stat count as zeros, so a
+    # player's own absences (injury, inactive, benched) show up as a falling share instead of being skipped.
+    first = g.groupby(["player_id", "team"], as_index=False).week.min().rename(columns={"week": "first_week"})
+    g = first.merge(team.rename(columns={"targets": "t_targets", "carries": "t_carries",
+                                         "first_reads": "t_first_reads"}), on="team") \
+        .query("week >= first_week") \
+        .merge(g[["player_id", "team", "game_id", "targets", "carries", "first_reads"]],
+               on=["player_id", "team", "game_id"], how="left")
+    g["played"] = g.targets.notna().astype(int)
+    g[["targets", "carries", "first_reads"]] = g[["targets", "carries", "first_reads"]].fillna(0)
     stats = ["targets", "carries", "first_reads", "t_targets", "t_carries", "t_first_reads"]
-    agg = g.groupby(["player_id", "team", "recent"])[stats].sum(min_count=1)
-    agg["games"] = g.groupby(["player_id", "team", "recent"]).size()
+    keys = ["player_id", "team", "recent"]
+    agg = g.groupby(keys)[stats].sum(min_count=1)
+    agg["games"] = g.groupby(keys).played.sum()  # games with a stat
+    agg["team_games"] = g.groupby(keys).size()
     before = agg.xs(False, level="recent")
     after = agg.xs(True, level="recent")
     both = after.join(before, lsuffix="_a", rsuffix="_b", how="outer")
@@ -566,6 +580,14 @@ def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_ga
         both[f"{col}_share_b"] = [share(r, col, "b") for _, r in both.iterrows()]
 
     def reason(pid, tm, r, col, unit, group, change):
+        missed_a, missed_b = int(r.team_games_a - r.games_a), int(r.team_games_b - r.games_b)
+        if change < 0 and missed_a:
+            ir = " (now on IR)" if r.status == "RES" else ""
+            return (f"No stat in {missed_a} of {tm}'s last {window} games{ir} — check injury/inactive status "
+                    f"before starting.")
+        if change > 0 and missed_b:
+            return (f"Back in the lineup: no stat in {missed_b} earlier game{'s' if missed_b > 1 else ''}, "
+                    f"{r[f'{col}_a'] / r.team_games_a:.1f} {unit}/gm over the last {window}.")
         mates = both.xs(tm, level="team").drop(index=pid, errors="ignore")
         mates = mates[mates.position.isin(group)]
         # The teammate whose share moved most the other way explains it best. No stat in a window counts as 0%.
@@ -581,17 +603,17 @@ def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_ga
         if len(swing) and swing.abs().max() >= 0.05:
             m = mates.loc[swing.abs().idxmax()]
             who = f"{m['name']} ({m.position})"
-            if pd.isna(m.games_a):
+            if not m.games_a > 0:
                 ir = ", now on IR," if m.status == "RES" else ""
                 return (f"{who}{ir} hasn't recorded a stat in the last {window} games after getting "
                         f"{m[f'{col}_share_b']:.0%} of {tm}'s {unit} before.")
-            if pd.isna(m.games_b):
+            if not m.games_b > 0:
                 return f"{who} joined the mix, taking {m[f'{col}_share_a']:.0%} of {unit} over the last {window}."
             way = "away from" if change > 0 else "to"
             return (f"Work shifting {way} {who}: {m[f'{col}_share_b']:.0%} → "
                     f"{m[f'{col}_share_a']:.0%} of {unit}.")
-        own_a, own_b = r[f"{col}_a"] / r.games_a, r[f"{col}_b"] / r.games_b
-        tot_a, tot_b = r[f"t_{col}_a"] / r.games_a, r[f"t_{col}_b"] / r.games_b
+        own_a, own_b = r[f"{col}_a"] / r.team_games_a, r[f"{col}_b"] / r.team_games_b
+        tot_a, tot_b = r[f"t_{col}_a"] / r.team_games_a, r[f"t_{col}_b"] / r.team_games_b
         return (f"{own_a:.1f} {unit}/gm over the last {window} vs {own_b:.1f} before, on {tot_a:.0f} vs "
                 f"{tot_b:.0f} team {unit}/gm — {'a bigger' if change > 0 else 'a smaller'} slice, not just "
                 f"{'more' if change > 0 else 'less'} team volume." if abs(tot_a - tot_b) / max(tot_b, 1) < 0.15 else
@@ -600,13 +622,13 @@ def usage_shifts(ctx: dict, window: int = 2, threshold: float = 0.08, min_per_ga
 
     rows = []
     for (pid, tm), r in both[both.position.isin(["RB", "WR", "TE"])].iterrows():
-        if pd.isna(r.games_a) or pd.isna(r.games_b):
-            continue
+        if pd.isna(r.team_games_a) or pd.isna(r.team_games_b):
+            continue  # joined the team within the window: nothing to compare with
         for label, (col, unit, group) in SHIFT_METRICS.items():
             a, b = r[f"{col}_share_a"], r[f"{col}_share_b"]
             if pd.isna(a) or pd.isna(b) or abs(a - b) < threshold:
                 continue
-            if max(r[f"{col}_a"] / r.games_a, r[f"{col}_b"] / r.games_b) < min_per_game:
+            if max(r[f"{col}_a"] / r.team_games_a, r[f"{col}_b"] / r.team_games_b) < min_per_game:
                 continue  # e.g. 0 -> 1 target: a big share swing on almost no volume
             rows.append({"player_id": pid, "name": r["name"], "position": r.position, "team": tm, "metric": label,
                          "last": a, "before": b, "change": a - b, "games_last": int(r.games_a),

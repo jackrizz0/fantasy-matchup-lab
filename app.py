@@ -563,9 +563,10 @@ with tab_shift:
     before_games = int(played_through) - 2 if played_through else 0
     st.caption(
         f"Share of team targets, carries and first-read throws over each team's **last 2 games** vs the rest of the "
-        f"{season} season, counting only games the player recorded a stat in. Changes of 8+ points are listed; ones "
-        "where the player never averaged 2+ of that stat per game are skipped. First-read share comes from "
-        f"{season} FTN charting. \"Why\" names the teammate whose share moved most the other way."
+        f"{season} season since the player joined the team. A game without a target or carry counts as zero, so "
+        "injuries and benchings show up. Changes of 8+ points are listed; ones where the player never averaged 2+ "
+        f"of that stat per game are skipped. First-read share comes from {season} FTN charting. \"Why\" points to "
+        "the player's own missed games first, otherwise the teammate whose share moved most the other way."
         + (f"  \n⚠️ Only {before_games} earlier game{'s' * (before_games != 1)} to compare against so far — expect "
            "big swings until the sample grows." if 0 < before_games < 3 else ""))
 
